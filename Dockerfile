@@ -8,7 +8,7 @@ WORKDIR /app
 COPY . /app
 
 # Устанавливаем зависимости
-RUN pip install --no-cache-dir pyTelegramBotAPI
+RUN pip install -r requirements.txt
 
 # Запускаем бота
 CMD ["python", "main.py"]
