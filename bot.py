@@ -9,5 +9,4 @@ def setup_bot_handlers(bot):
 
     @bot.message_handler(func=lambda message: True)
     def echo_all(message):
-        save_message(message.chat.id, message.text)  # Сохраняем сообщение в БД
         bot.send_message(message.chat.id, "Ваше сообщение было отправлено", reply_markup=generate_contact_keyboard())
