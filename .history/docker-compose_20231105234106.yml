@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    environment:
+      - TELEGRAM_TOKEN=ваш_токен_бота
+      - MANAGER_USERNAME=username_менеджера
+    volumes:
+      - ./db:/app/db
+      - ./logs:/app/logs
+    restart: always
