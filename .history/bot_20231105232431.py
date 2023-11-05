@@ -1,0 +1,1 @@
+MANAGER_USERNAME=@username_менеджера
