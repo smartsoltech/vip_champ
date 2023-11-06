@@ -1,6 +1,6 @@
 from telebot import TeleBot, types
 from db import set_setting, get_setting, get_admin, add_admin, remove_admin, authenticate_admin, authenticate_super_admin
-from db import get_or_create_client, init_db, get_all_clients
+from db import get_or_create_client, init_db, get_all_clients, export_clients_to_csv, is_admin
 from kb import generate_contact_keyboard, generate_admin_keyboard
 import os
 from dotenv import load_dotenv
@@ -141,6 +141,26 @@ def setup_bot_handlers(bot):
         except Exception as e:
             bot.reply_to(message, f"Произошла ошибка: {e}")
 
+    def check_masteradmin_credentials(login, password):
+        return login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD
+
+    @bot.message_handler(commands=['export_clients'])
+    def handle_export_clients_command(message):
+        msg = bot.send_message(message.chat.id, "Введите логин и пароль мастер-админа:")
+        bot.register_next_step_handler(msg, process_export_clients)
+
+    def process_export_clients(message):
+        try:
+            login, password = message.text.split()
+            if check_masteradmin_credentials(login, password):
+                # Пароль верный, выполняем экспорт клиентов
+                clients_csv = export_clients_to_csv()
+                bot.send_document(message.chat.id, ('clients.csv', clients_csv.getvalue().encode('utf-8')), caption='Here is the list of all clients.')
+                bot.send_message(message.chat.id, "Экспорт клиентов выполнен.")
+            else:
+                bot.send_message(message.chat.id, "Неверный логин или пароль.")
+        except ValueError:
+            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
 
                     
     # стандартный ответ на неизвестные запросы - это самый посследний хэндлер. все хэндлеры ниже него работать не будут!!!!

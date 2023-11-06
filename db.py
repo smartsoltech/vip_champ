@@ -1,5 +1,6 @@
 # db.py
-
+import csv
+from io import StringIO
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session, joinedload
@@ -121,3 +122,24 @@ def remove_admin(username):
         session.commit()
         return True
     return False
+
+def export_clients_to_csv():
+    # Замените следующую строку на запрос к вашей базе данных для получения данных клиентов
+    clients = session.query(Client).all()  # Это пример, используйте вашу сессию и модель
+    output = StringIO()
+    writer = csv.writer(output)
+
+    # Запись заголовков CSV
+    writer.writerow(['ID', 'First Name', 'Last Name', 'Chat ID'])
+
+    # Запись данных клиентов
+    for client in clients:
+        writer.writerow([client.id, client.first_name, client.last_name, client.chat_id])
+
+    output.seek(0)
+    return output
+
+# Функция для проверки, является ли пользователь администратором
+def is_admin(user_id):
+    # Замените следующую строку на проверку, является ли user_id администратором в вашей системе
+    return session.query(Admin).filter(Admin.chat_id == user_id).first() is not None
