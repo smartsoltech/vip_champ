@@ -2,11 +2,59 @@
 
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, scoped_session, joinedload
+from sqlalchemy.exc import IntegrityError
+from contextlib import contextmanager
+import os
 
-DATABASE_URL = "sqlite:///./db/settings.db"  # Используйте ваш путь к файлу базы данных
+DATABASE_URL = "sqlite:///./db/settings.db" # Используйте ваш путь к файлу базы данных
+engine = create_engine(DATABASE_URL)
 Base = declarative_base()
+session_factory = sessionmaker(bind=engine)
+Session = scoped_session(session_factory)
 
+
+class Client(Base):
+    __tablename__ = 'clients'
+    id = Column(Integer, primary_key=True)
+    first_name = Column(String)
+    last_name = Column(String)
+    chat_id = Column(Integer, unique=True)
+    is_bot = Column(Boolean, default=False)
+
+@contextmanager
+def session_scope():
+    """Provide a transactional scope around a series of operations."""
+    session = Session()
+    try:
+        yield session
+        session.commit()
+    except:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+def init_db():
+    Base.metadata.create_all(engine)
+    
+def get_all_clients():
+    with session_scope() as session:
+        clients = session.query(Client.first_name, Client.chat_id).filter_by(is_bot=False).all()
+        return [{'first_name': client.first_name, 'chat_id': client.chat_id} for client in clients]
+    
+def get_or_create_client(chat_id, first_name, last_name, is_bot):
+    with session_scope() as session:
+        client = session.query(Client).filter_by(chat_id=chat_id).first()
+        if not client and not is_bot:
+            client = Client(chat_id=chat_id, first_name=first_name, last_name=last_name, is_bot=is_bot)
+            session.add(client)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()  # Rollback the failed transaction
+                client = session.query(Client).filter_by(chat_id=chat_id).first()  # Try to fetch again
+        return client
 class Setting(Base):
     __tablename__ = 'settings'
     id = Column(Integer, primary_key=True)

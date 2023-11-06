@@ -1,5 +1,6 @@
 from telebot import TeleBot, types
 from db import set_setting, get_setting, get_admin, add_admin, remove_admin, authenticate_admin, authenticate_super_admin
+from db import get_or_create_client, init_db, get_all_clients
 from kb import generate_contact_keyboard, generate_admin_keyboard
 import os
 from icecream import ic
@@ -13,8 +14,21 @@ MASTERADMIN_PASSWORD = os.getenv('MASTERADMIN_PASSWORD')
 def setup_bot_handlers(bot):
     @bot.message_handler(commands=['start', 'help'])
     def send_welcome(message):
-        bot.reply_to(message, "Добро пожаловать в онлайн клуб VIP 🎉🥂", reply_markup=generate_contact_keyboard())
+        if message.from_user.is_bot:
+            bot.reply_to(message, "Мы не общаемся с ботами.")
+            return
 
+        client = get_or_create_client(
+            chat_id=message.chat.id,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+            is_bot=message.from_user.is_bot
+        )
+        if client:
+            bot.reply_to(message, "Выберите опцию:", reply_markup=generate_contact_keyboard())
+        else:
+            bot.reply_to(message, "Произошла ошибка при сохранении данных.")
+            
     @bot.message_handler(commands=['settings'])
     def settings_command(message):
         msg = bot.reply_to(message, "Введите логин и пароль через пробел:")
@@ -111,9 +125,46 @@ def setup_bot_handlers(bot):
             bot.reply_to(message, f"Вы являетесь {status}.")
         else:
             bot.reply_to(message, "Вы не являетесь администратором.")
-                
-    # стандартный ответ на неизвестные запросы
+          
+    @bot.message_handler(func=lambda message: message.text.startswith('/send_all'))
+    def send_all(message):
+        try:
+            parts = message.text.split(' ', 3)
+            if len(parts) < 4:
+                bot.reply_to(message, "Неправильный формат команды. Нужно: /send_all [login] [password] [message]")
+                return
+
+            _, login, password, text = parts
+
+            if login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD:
+                clients = get_all_clients()
+                for client_data in clients:
+                    personalized_message = f"Привет, {client_data['first_name']}!\n{text}"
+                    bot.send_message(client_data['chat_id'], personalized_message)
+                bot.reply_to(message, "Сообщение отправлено всем клиентам.")
+            else:
+                bot.reply_to(message, "У вас нет прав для выполнения этой команды.")
+        except Exception as e:
+            ic(e)
+            bot.reply_to(message, f"Произошла ошибка: {e}")
+
+
+                    
+    # стандартный ответ на неизвестные запросы - это самый посследний хэндлер. все хэндлеры ниже него работать не будут!!!!
     @bot.message_handler(func=lambda message: True)
-    def echo_all(message):
-        bot.send_message(message.chat.id, "Введите /help для просмотра информации")
+    def handle_message(message):
+        if message.from_user.is_bot:
+            bot.reply_to(message, "Мы не общаемся с ботами.")
+            return
+
+        client = get_or_create_client(
+            chat_id=message.chat.id,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+            is_bot=message.from_user.is_bot
+        )
+        if client:
+            bot.reply_to(message, "Выберите опцию:", reply_markup=generate_contact_keyboard())
+        else:
+            bot.reply_to(message, "Произошла ошибка при сохранении данных.")
 
