@@ -136,7 +136,7 @@ def setup_bot_handlers(bot):
 
             _, login, password, text = parts
 
-            if login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD:
+            if login == SUPERADMIN_LOGIN and password == SUPERADMIN_PASSWORD:
                 clients = get_all_clients()
                 for client_data in clients:
                     personalized_message = f"Привет, {client_data['first_name']}!\n{text}"

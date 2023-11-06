@@ -129,25 +129,27 @@ def setup_bot_handlers(bot):
     @bot.message_handler(func=lambda message: message.text.startswith('/send_all'))
     def send_all(message):
         try:
-            parts = message.text.split(' ', 3)
+            # Разделяем сообщение на части
+            parts = message.text.split(' ', 3)  # Разделяем на четыре части
             if len(parts) < 4:
                 bot.reply_to(message, "Неправильный формат команды. Нужно: /send_all [login] [password] [message]")
                 return
 
-            _, login, password, text = parts
+            command, login, password, text = parts
 
+            # Проверяем, что пользователь является суперадминистратором
             if login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD:
                 clients = get_all_clients()
-                for client_data in clients:
-                    personalized_message = f"Привет, {client_data['first_name']}!\n{text}"
-                    bot.send_message(client_data['chat_id'], personalized_message)
+                for client in clients:
+                    personalized_message = f"Привет, {client.first_name}!\n{text}"
+                    bot.send_message(client.chat_id, personalized_message)
+                    ic(client, personalized_message)
                 bot.reply_to(message, "Сообщение отправлено всем клиентам.")
             else:
                 bot.reply_to(message, "У вас нет прав для выполнения этой команды.")
         except Exception as e:
             ic(e)
             bot.reply_to(message, f"Произошла ошибка: {e}")
-
 
                     
     # стандартный ответ на неизвестные запросы - это самый посследний хэндлер. все хэндлеры ниже него работать не будут!!!!

@@ -13,15 +13,6 @@ Base = declarative_base()
 session_factory = sessionmaker(bind=engine)
 Session = scoped_session(session_factory)
 
-
-class Client(Base):
-    __tablename__ = 'clients'
-    id = Column(Integer, primary_key=True)
-    first_name = Column(String)
-    last_name = Column(String)
-    chat_id = Column(Integer, unique=True)
-    is_bot = Column(Boolean, default=False)
-
 @contextmanager
 def session_scope():
     """Provide a transactional scope around a series of operations."""
@@ -40,8 +31,8 @@ def init_db():
     
 def get_all_clients():
     with session_scope() as session:
-        clients = session.query(Client.first_name, Client.chat_id).filter_by(is_bot=False).all()
-        return [{'first_name': client.first_name, 'chat_id': client.chat_id} for client in clients]
+        clients = session.query(Client).options(joinedload(Client.some_relationship)).filter_by(is_bot=False).all()
+        return clients
     
 def get_or_create_client(chat_id, first_name, last_name, is_bot):
     with session_scope() as session:

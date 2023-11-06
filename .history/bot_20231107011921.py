@@ -1,6 +1,6 @@
 from telebot import TeleBot, types
 from db import set_setting, get_setting, get_admin, add_admin, remove_admin, authenticate_admin, authenticate_super_admin
-from db import get_or_create_client, init_db, get_all_clients
+from db import get_or_create_client, init_db
 from kb import generate_contact_keyboard, generate_admin_keyboard
 import os
 from icecream import ic
@@ -126,30 +126,23 @@ def setup_bot_handlers(bot):
         else:
             bot.reply_to(message, "Вы не являетесь администратором.")
           
-    @bot.message_handler(func=lambda message: message.text.startswith('/send_all'))
-    def send_all(message):
-        try:
-            parts = message.text.split(' ', 3)
-            if len(parts) < 4:
-                bot.reply_to(message, "Неправильный формат команды. Нужно: /send_all [login] [password] [message]")
-                return
+        @bot.message_handler(commands=['send_all'])
+        def send_all(message):
+            try:
+                # Разделяем сообщение на части
+                command, login, password, *text_parts = message.text.split(maxsplit=3)
+                text = text_parts[0] if text_parts else ""
 
-            _, login, password, text = parts
-
-            if login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD:
-                clients = get_all_clients()
-                for client_data in clients:
-                    personalized_message = f"Привет, {client_data['first_name']}!\n{text}"
-                    bot.send_message(client_data['chat_id'], personalized_message)
-                bot.reply_to(message, "Сообщение отправлено всем клиентам.")
-            else:
-                bot.reply_to(message, "У вас нет прав для выполнения этой команды.")
-        except Exception as e:
-            ic(e)
-            bot.reply_to(message, f"Произошла ошибка: {e}")
-
-
-                    
+                # Проверяем, что пользователь является суперадминистратором
+                if login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD:
+                    chat_ids = get_all_clients()
+                    for chat_id in chat_ids:
+                        bot.send_message(chat_id, text)
+                    bot.reply_to(message, "Сообщение отправлено всем клиентам.")
+                else:
+                    bot.reply_to(message, "У вас нет прав для выполнения этой команды.")
+            except Exception as e:
+                bot.reply_to(message, f"Произошла ошибка: {e}")      
     # стандартный ответ на неизвестные запросы - это самый посследний хэндлер. все хэндлеры ниже него работать не будут!!!!
     @bot.message_handler(func=lambda message: True)
     def handle_message(message):

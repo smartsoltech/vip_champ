@@ -40,8 +40,8 @@ def init_db():
     
 def get_all_clients():
     with session_scope() as session:
-        clients = session.query(Client.first_name, Client.chat_id).filter_by(is_bot=False).all()
-        return [{'first_name': client.first_name, 'chat_id': client.chat_id} for client in clients]
+        clients = session.query(Client).options(joinedload(Client.some_relationship)).filter_by(is_bot=False).all()
+        return clients
     
 def get_or_create_client(chat_id, first_name, last_name, is_bot):
     with session_scope() as session:

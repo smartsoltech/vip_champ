@@ -2,17 +2,10 @@
 
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, scoped_session, joinedload
-from sqlalchemy.exc import IntegrityError
-from contextlib import contextmanager
-import os
+from sqlalchemy.orm import sessionmaker
 
-DATABASE_URL = "sqlite:///./db/settings.db" # Используйте ваш путь к файлу базы данных
-engine = create_engine(DATABASE_URL)
+DATABASE_URL = "sqlite:///./db/settings.db"  # Используйте ваш путь к файлу базы данных
 Base = declarative_base()
-session_factory = sessionmaker(bind=engine)
-Session = scoped_session(session_factory)
-
 
 class Client(Base):
     __tablename__ = 'clients'
@@ -37,12 +30,7 @@ def session_scope():
 
 def init_db():
     Base.metadata.create_all(engine)
-    
-def get_all_clients():
-    with session_scope() as session:
-        clients = session.query(Client.first_name, Client.chat_id).filter_by(is_bot=False).all()
-        return [{'first_name': client.first_name, 'chat_id': client.chat_id} for client in clients]
-    
+
 def get_or_create_client(chat_id, first_name, last_name, is_bot):
     with session_scope() as session:
         client = session.query(Client).filter_by(chat_id=chat_id).first()

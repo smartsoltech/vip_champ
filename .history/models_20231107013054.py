@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Boolean
+from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -20,13 +20,6 @@ class Setting(Base):
     id = Column(Integer, primary_key=True)
     key = Column(String, unique=True, nullable=False)
     value = Column(String, nullable=False)
-class Client(Base):
-    __tablename__ = 'clients'
-    id = Column(Integer, primary_key=True)
-    first_name = Column(String)
-    last_name = Column(String)
-    chat_id = Column(Integer, unique=True)
-    is_bot = Column(Boolean, default=False)
 
 Base.metadata.create_all(engine)
 
