@@ -12,8 +12,8 @@ def generate_contact_keyboard():
     # Создаем кнопки с полученными данными
     deposit_button = types.InlineKeyboardButton(text="💰 Внести депозит", url=f'https://t.me/{manager_contact}')
     contact_button = types.InlineKeyboardButton(text="🤝 Связаться с менеджером", url=f'https://t.me/{manager_contact}')
-    channel_button = types.InlineKeyboardButton(text="📢 Перейти в канал", url=f'https://t.me/{channel_link}')
-    chat_button = types.InlineKeyboardButton(text="💬 Перейти в чат розыгрыша", url=f'https://t.me/{bot_link}')
+    channel_button = types.InlineKeyboardButton(text="📢 Перейти в канал", url='fhttps://t.me/{channel_link}')
+    chat_button = types.InlineKeyboardButton(text="💬 Перейти в чат розыгрыша", url='https://t.me/{bot_link}')
 
     # Добавляем каждую кнопку в отдельный ряд
     keyboard.row(deposit_button)

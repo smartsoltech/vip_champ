@@ -49,7 +49,6 @@ def setup_bot_handlers(bot):
         bot.send_message(message.chat.id, "Контакт менеджера успешно обновлен.")
 
     # Обработчик для команды "Изменить ссылку на канал"
-    @bot.message_handler(func=lambda message: message.text == 'Изменить ссылку на канал')
     def change_channel_link(message):
         msg = bot.reply_to(message, "Отправьте новую ссылку на канал.")
         bot.register_next_step_handler(msg, process_channel_link)
@@ -59,7 +58,7 @@ def setup_bot_handlers(bot):
         bot.send_message(message.chat.id, "Ссылка на канал успешно обновлена.")
 
     # Обработчик для изменения ссылки на бота
-    @bot.message_handler(func=lambda message: message.text == 'Изменить ссылку на бота')
+    @bot.message_handler(func=lambda message: message.text == 'Изменить ссылку на бота' and authenticate_admin(message.from_user.id))
     def change_bot_link(message):
         msg = bot.reply_to(message, "Отправьте новую ссылку на бота.")
         bot.register_next_step_handler(msg, process_bot_link)

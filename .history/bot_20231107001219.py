@@ -3,9 +3,6 @@ from db import set_setting, get_setting, get_admin, add_admin, remove_admin, aut
 from kb import generate_contact_keyboard, generate_admin_keyboard
 import os
 from icecream import ic
-from dotenv import load_dotenv
-
-load_dotenv()
 
 MASTERADMIN_LOGIN = os.getenv('MASTERADMIN_LOGIN')
 MASTERADMIN_PASSWORD = os.getenv('MASTERADMIN_PASSWORD')
@@ -21,7 +18,6 @@ def setup_bot_handlers(bot):
         bot.register_next_step_handler(msg, process_login_step)
 
     def process_login_step(message):
-        ic(MASTERADMIN_LOGIN, MASTERADMIN_PASSWORD)
         try:
             parts = message.text.split()
             if len(parts) == 2:
@@ -29,16 +25,12 @@ def setup_bot_handlers(bot):
                 ic(login, password)
                 if login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD:
                     bot.send_message(message.chat.id, "Аутентификация успешна!", reply_markup=generate_admin_keyboard(True))
-                    ic(login, password)
                 else:
-                    ic(login, password)
                     bot.send_message(message.chat.id, "Неверный логин или пароль.")
             else:
                 raise ValueError("Неверный формат. Нужно ввести логин и пароль, разделенные пробелом.")
         except Exception as e:
-            ic(e)
             bot.reply_to(message, "Произошла ошибка при вводе. Пожалуйста, введите логин и пароль через пробел.")
-            
     @bot.message_handler(func=lambda message: message.text == 'Изменить контакт менеджера')
     def change_manager_contact(message):
         msg = bot.reply_to(message, "Отправьте новый контакт менеджера.")
@@ -49,7 +41,6 @@ def setup_bot_handlers(bot):
         bot.send_message(message.chat.id, "Контакт менеджера успешно обновлен.")
 
     # Обработчик для команды "Изменить ссылку на канал"
-    @bot.message_handler(func=lambda message: message.text == 'Изменить ссылку на канал')
     def change_channel_link(message):
         msg = bot.reply_to(message, "Отправьте новую ссылку на канал.")
         bot.register_next_step_handler(msg, process_channel_link)
@@ -59,7 +50,7 @@ def setup_bot_handlers(bot):
         bot.send_message(message.chat.id, "Ссылка на канал успешно обновлена.")
 
     # Обработчик для изменения ссылки на бота
-    @bot.message_handler(func=lambda message: message.text == 'Изменить ссылку на бота')
+    @bot.message_handler(func=lambda message: message.text == 'Изменить ссылку на бота' and authenticate_admin(message.from_user.id))
     def change_bot_link(message):
         msg = bot.reply_to(message, "Отправьте новую ссылку на бота.")
         bot.register_next_step_handler(msg, process_bot_link)
