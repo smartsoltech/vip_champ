@@ -1,6 +1,6 @@
 from telebot import TeleBot, types
 from db import set_setting, get_setting, get_admin, add_admin, remove_admin, authenticate_admin, authenticate_super_admin
-from db import get_or_create_client, get_settings, get_all_clients, export_clients_to_csv, is_admin, get_all_admin
+from db import get_or_create_client, get_settings, get_all_clients, export_clients_to_csv, is_admin
 from kb import generate_contact_keyboard, generate_admin_keyboard, generate_admin_inline_keyboard
 from db import Admin, session
 import os, csv, io
@@ -61,62 +61,48 @@ def setup_bot_handlers(bot):
     @bot.callback_query_handler(func=lambda call: True)
     def handle_callback_query(call):
         if call.data == "change_manager_contact":
-            msg = bot.send_message(call.message.chat.id, "Отправьте новый контакт менеджера.")
-            bot.register_next_step_handler(msg, process_manager_contact)
             ic(call.data)
+            # Логика для изменения контакта менеджера
         elif call.data == "change_channel_link":
-            msg = bot.send_message(call.message.chat.id, "Отправьте новую ссылку на канал.")
-            bot.register_next_step_handler(msg, process_channel_link)
-            ic(call.data)
+            # Логика для изменения ссылки на канал
+           ic(call.data)
         elif call.data == "change_bot_link":
-            msg = bot.send_message(call.message.chat.id, "Отправьте новую ссылку на бота.")
-            bot.register_next_step_handler(msg, process_bot_link)
+            # Логика для изменения ссылки на бота
+            ic(call.data)
+        elif call.data == "export_clients":
+            # Логика для экспорта клиентов
+            ic(call.data)
+        elif call.data == "get_admins":
+            # Логика для получения списка админов
+            ic(call.data)
+        elif call.data == "add_admin":
+            # Логика для добавления админа
             ic(call.data)
         elif call.data == "remove_admin":
-            msg = bot.send_message(call.message.chat.id, "Введите логин админа для удаления:")
-            bot.register_next_step_handler(msg, process_remove_admin)
+            # Логика для удаления админа
             ic(call.data)
-        elif call.data == "check_admin":
-            process_check_admin(call.message)
-            ic(call.data)
-        elif call.data == 'get_admins':
-            msg = bot.send_message(call.message.chat.id, "Введите логин и пароль через пробел для аутентификации:")
-            bot.register_next_step_handler(msg, process_get_admins_login)
-            ic(call.data)
-        elif call.data == 'export_clients':
-            msg = bot.send_message(call.message.chat.id, "Требуется авторизаци. Введите логин и пароль администратора:")
-            bot.register_next_step_handler(msg, process_export_clients)
-            ic(call.data)
-        elif call.data == "send_all":
-            msg = bot.send_message(call.message.chat.id, "Введите сообщение для отправки всем клиентам:")
-            bot.register_next_step_handler(msg, process_send_all_message)
-            ic(call.data)
-        ic(call.data)
-        bot.answer_callback_query(call.id)
-        
-    # Не забудьте всегда отвечать на callback, чтобы убрать часы загрузки на кнопке
+        # Не забудьте всегда отвечать на callback, чтобы убрать часы загрузки на кнопке
         bot.answer_callback_query(call.id)
   # обработка действий по inline клаве
-  # смена контакта менеджера
     def process_manager_contact(message):
         set_setting('manager_contact', message.text)
-        bot.send_message(message.chat.id, "Контакт менеджера успешно обновлен.", reply_markup = generate_admin_inline_keyboard())
-  # смена ссылки на канал
+        bot.send_message(message.chat.id, "Контакт менеджера успешно обновлен.")
+
     def process_channel_link(message):
         set_setting('channel_link', message.text)
-        bot.send_message(message.chat.id, "Ссылка на канал успешно обновлена.", reply_markup = generate_admin_inline_keyboard())
-  # смена ссылки на бота
+        bot.send_message(message.chat.id, "Ссылка на канал успешно обновлена.")
+
     def process_bot_link(message):
         set_setting('bot_link', message.text)
-        bot.send_message(message.chat.id, "Ссылка на бота успешно обновлена.", reply_markup = generate_admin_inline_keyboard())
-  # удаление админа
+        bot.send_message(message.chat.id, "Ссылка на бота успешно обновлена.")
+
     def process_remove_admin(message):
         username = message.text.strip()
         if remove_admin(username):
-            bot.send_message(message.chat.id, f"Админ {username} успешно удален.", reply_markup = generate_admin_inline_keyboard())
+            bot.send_message(message.chat.id, f"Админ {username} успешно удален.")
         else:
             bot.send_message(message.chat.id, "Не удалось удалить админа.")
-  #  проверка админа
+
     def process_check_admin(message):
         username = message.from_user.username
         if authenticate_admin(username):
@@ -127,26 +113,57 @@ def setup_bot_handlers(bot):
             bot.send_message(message.chat.id, f"Вы являетесь {status}.")
         else:
             bot.send_message(message.chat.id, "Вы не являетесь администратором.")
-  # рассылка сообщения клиентам
-    def process_send_all_message(message):
-        text = message.text
-        clients = get_all_clients()
-        for client_data in clients:
-            personalized_message = f"Привет, {client_data['first_name']}!\n{text}"
-            bot.send_message(client_data['chat_id'], personalized_message)
-        bot.reply_to(message, "Сообщение отправлено всем клиентам.")
-  # получение списка админов   
-    def process_get_admins_login(message):
-        admins_list = get_all_admin()
-        ic(admins_list)
-        # response = '\n'.join([f"{admin.username} (Суперадмин: {'Да' if admin.is_superadmin else 'Нет'})" for admin in admins_list])
-        response = '\n'.join([
-            f"{admin['username']} (Суперадмин: {'Да' if admin['is_superadmin'] else 'Нет'})" 
-            for admin in admins_list
-        ])
-        bot.send_message(message.chat.id, f'Список админов:\n{response}', reply_markup=generate_admin_inline_keyboard())
+  
+        
+    @bot.message_handler(func=lambda message: message.text.startswith('/send_all'))
+    def send_all(message):
+        msg = bot.reply_to(message, "Введите логин и пароль через пробел для аутентификации:")
+        bot.register_next_step_handler(msg, process_send_all_login, message.text)
 
-   # экспорт клиентов в csv           
+    def process_send_all_login(message, command_text):
+        try:
+            username, password = message.text.split(' ', 1)
+            if authenticate_admin(username, password):
+                _, text = command_text.split(' ', 1)
+                clients = get_all_clients()
+                for client_data in clients:
+                    personalized_message = f"Привет, {client_data['first_name']}!\n{text}"
+                    bot.send_message(client_data['chat_id'], personalized_message)
+                bot.reply_to(message, "Сообщение отправлено всем клиентам.")
+            else:
+                bot.reply_to(message, "Неверный логин или пароль.")
+        except ValueError:
+            bot.reply_to(message, "Введите логин и пароль через пробел.")
+            
+    # @bot.message_handler(func=lambda message: message.text.startswith('/send_all'))
+    # def send_all(message):
+    #     try:
+    #         parts = message.text.split(' ', 3)
+    #         if len(parts) < 4:
+    #             bot.reply_to(message, "Неправильный формат команды. Нужно: /send_all [login] [password] [message]")
+    #             return
+
+    #         _, login, password, text = parts
+
+    #         if login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD:
+    #             clients = get_all_clients()
+    #             for client_data in clients:
+    #                 personalized_message = f"Привет, {client_data['first_name']}!\n{text}"
+    #                 bot.send_message(client_data['chat_id'], personalized_message)
+    #             bot.reply_to(message, "Сообщение отправлено всем клиентам.")
+    #         else:
+    #             bot.reply_to(message, "У вас нет прав для выполнения этой команды.")
+    #     except Exception as e:
+    #         bot.reply_to(message, f"Произошла ошибка: {e}")
+
+    def check_masteradmin_credentials(login, password):
+        return login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD
+
+    @bot.message_handler(commands=['export_clients'])
+    def handle_export_clients_command(message):
+        msg = bot.send_message(message.chat.id, "Введите логин и пароль мастер-админа:")
+        bot.register_next_step_handler(msg, process_export_clients)
+
     def process_export_clients(message):
         # Создаем объект StringIO для хранения данных CSV
         clients_csv = io.StringIO()
@@ -171,19 +188,45 @@ def setup_bot_handlers(bot):
 
         # Не забудьте закрыть StringIO объект после использования
         clients_csv.close()
-            
-  
-    def check_masteradmin_credentials(login, password):
-        return login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD
-
- 
-  
         
         
     # Обработчик команды для получения списка админов
     
+    @bot.message_handler(commands=['get_admins'])
+    def handle_get_admins_command(message):
+        msg = bot.send_message(message.chat.id, "Введите логин и пароль через пробел для аутентификации:")
+        bot.register_next_step_handler(msg, process_get_admins_login)
 
-    
+    def process_get_admins_login(message):
+        try:
+            username, password = message.text.split(' ', 1)
+            if authenticate_admin(username, password):
+                admins_list = get_admin()
+                ic(admins_list)
+                response = '\n'.join([f"{admin.username} (Суперадмин: {'Да' if admin.is_superadmin else 'Нет'})" for admin in admins_list])
+                bot.send_message(message.chat.id, f'Список админов:\n{response}')
+            else:
+                bot.send_message(message.chat.id, "Неверный логин или пароль.")
+        except ValueError:
+            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
+            ic(ValueError)
+
+    # @bot.message_handler(commands=['get_admins'])
+    # def handle_get_admins_command(message):
+    #     msg = bot.send_message(message.chat.id, "Введите логин и пароль мастер-админа:")
+    #     bot.register_next_step_handler(msg, process_get_admins)
+
+    # def process_get_admins(message):
+    #     try:
+    #         login, password = message.text.split()
+    #         if check_masteradmin_credentials(login, password):
+    #             admins_list = get_admin()
+    #             # Отправка списка админов пользователю
+    #             bot.send_message(message.chat.id, f'Список админов: {admins_list}')
+    #         else:
+    #             bot.send_message(message.chat.id, "Неверный логин или пароль.")
+    #     except ValueError:
+    #         bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
 
     # Обработчик команды для получения настроек
     @bot.message_handler(commands=['get_settings'])
@@ -203,7 +246,26 @@ def setup_bot_handlers(bot):
         except ValueError:
             bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
 
-       
+    
+    # @bot.message_handler(commands=['get_settings'])
+    # def handle_get_settings_command(message):
+    #     msg = bot.send_message(message.chat.id, "Введите логин и пароль мастер-админа:")
+    #     bot.register_next_step_handler(msg, process_get_settings)
+
+    # def process_get_settings(message):
+    #     try:
+    #         login, password = message.text.split()
+    #         if check_masteradmin_credentials(login, password):
+    #             settings = get_settings()
+    #             for setting in settings:
+    #                 # Отправка настроек пользователю
+    #                 bot.send_message(message.chat.id, f"{setting['name']}: {setting['value']}")
+    #         else:
+    #             bot.send_message(message.chat.id, "Неверный логин или пароль.")
+    #     except ValueError:
+    #         bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
+            
+            
     SUPERADMIN_USERNAME = os.getenv('MASTERADMIN_USERNAME')
     SUPERADMIN_PASSWORD = os.getenv('MASTERADMIN_PASSWORD')
 
@@ -233,12 +295,9 @@ def setup_bot_handlers(bot):
             if add_admin(new_username, new_password):
                 bot.send_message(message.chat.id, f"Админ {new_username} успешно добавлен.")
                 ic(add_admin(new_username, new_password))
-                ic(new_username, new_password)
             else:
                 bot.send_message(message.chat.id, "Не удалось добавить админа.")
                 ic(new_username, new_password)
-                ic(new_username, new_password)
-
         except ValueError:
             bot.send_message(message.chat.id, "Введите логин и пароль нового админа через пробел.")
             ic(ValueError)

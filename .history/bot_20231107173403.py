@@ -139,11 +139,7 @@ def setup_bot_handlers(bot):
     def process_get_admins_login(message):
         admins_list = get_all_admin()
         ic(admins_list)
-        # response = '\n'.join([f"{admin.username} (Суперадмин: {'Да' if admin.is_superadmin else 'Нет'})" for admin in admins_list])
-        response = '\n'.join([
-            f"{admin['username']} (Суперадмин: {'Да' if admin['is_superadmin'] else 'Нет'})" 
-            for admin in admins_list
-        ])
+        response = '\n'.join([f"{admin.username} (Суперадмин: {'Да' if admin.is_superadmin else 'Нет'})" for admin in admins_list])
         bot.send_message(message.chat.id, f'Список админов:\n{response}', reply_markup=generate_admin_inline_keyboard())
 
    # экспорт клиентов в csv           

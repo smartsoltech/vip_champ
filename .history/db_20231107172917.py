@@ -120,11 +120,6 @@ def get_admin(usename):
     admins = session.query(Admin).all()
     return [{'id': admin.id, 'username': admin.username, 'is_superadmin': admin.is_superadmin} for admin in admins]
 
-
-def get_all_admin():
-    admins = session.query(Admin).all()
-    return [{'id': admin.id, 'username': admin.username, 'is_superadmin': admin.is_superadmin} for admin in admins]
-
 def add_admin(username, password_hash, is_superadmin=False):
     session = Session()
     # Проверяем, существует ли уже админ с таким именем пользователя
@@ -157,7 +152,6 @@ def authenticate_admin(username, password):
 def authenticate_super_admin(username):
     admin = get_admin()
     return admin and admin.is_superadmin
-
 
 def remove_admin(username):
     session = Session()

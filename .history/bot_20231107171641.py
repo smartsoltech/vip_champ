@@ -1,6 +1,6 @@
 from telebot import TeleBot, types
 from db import set_setting, get_setting, get_admin, add_admin, remove_admin, authenticate_admin, authenticate_super_admin
-from db import get_or_create_client, get_settings, get_all_clients, export_clients_to_csv, is_admin, get_all_admin
+from db import get_or_create_client, get_settings, get_all_clients, export_clients_to_csv, is_admin
 from kb import generate_contact_keyboard, generate_admin_keyboard, generate_admin_inline_keyboard
 from db import Admin, session
 import os, csv, io
@@ -137,13 +137,9 @@ def setup_bot_handlers(bot):
         bot.reply_to(message, "Сообщение отправлено всем клиентам.")
   # получение списка админов   
     def process_get_admins_login(message):
-        admins_list = get_all_admin()
+        admins_list = get_admin()
         ic(admins_list)
-        # response = '\n'.join([f"{admin.username} (Суперадмин: {'Да' if admin.is_superadmin else 'Нет'})" for admin in admins_list])
-        response = '\n'.join([
-            f"{admin['username']} (Суперадмин: {'Да' if admin['is_superadmin'] else 'Нет'})" 
-            for admin in admins_list
-        ])
+        response = '\n'.join([f"{admin.username} (Суперадмин: {'Да' if admin.is_superadmin else 'Нет'})" for admin in admins_list])
         bot.send_message(message.chat.id, f'Список админов:\n{response}', reply_markup=generate_admin_inline_keyboard())
 
    # экспорт клиентов в csv           

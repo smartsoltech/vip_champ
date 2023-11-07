@@ -1,7 +1,6 @@
 # db.py
 import csv
 from io import StringIO
-import sqlalchemy
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session, joinedload
@@ -110,42 +109,15 @@ class Admin(Base):
 Base.metadata.create_all(engine)
 
 # Функции для работы с администраторами
-# def add_admin(username, password, is_superadmin=False):
-#     new_admin = Admin(username=username, is_superadmin=is_superadmin)
-#     new_admin.set_password(password)
-#     session.add(new_admin)
-#     session.commit()
-    
-def get_admin(usename):
-    admins = session.query(Admin).all()
-    return [{'id': admin.id, 'username': admin.username, 'is_superadmin': admin.is_superadmin} for admin in admins]
-
-
-def get_all_admin():
-    admins = session.query(Admin).all()
-    return [{'id': admin.id, 'username': admin.username, 'is_superadmin': admin.is_superadmin} for admin in admins]
-
-def add_admin(username, password_hash, is_superadmin=False):
-    session = Session()
-    # Проверяем, существует ли уже админ с таким именем пользователя
-    existing_admin = session.query(Admin).filter_by(username=username).first()
-    if existing_admin is not None:
-        # Администратор с таким именем пользователя уже существует
-        session.close()
-        return False
-
-    # Если администратора с таким именем пользователя нет, добавляем нового
-    new_admin = Admin(username=username, password_hash=generate_password_hash(password_hash), is_superadmin=is_superadmin)
+def add_admin(username, password, is_superadmin=False):
+    new_admin = Admin(username=username, is_superadmin=is_superadmin)
+    new_admin.set_password(password)
     session.add(new_admin)
-    try:
-        session.commit()
-        return True
-    except sqlalchemy.exc.IntegrityError as e:
-        # Обрабатываем возможные ошибки целостности базы данных
-        session.rollback()
-        return False
-    finally:
-        session.close()
+    session.commit()
+    
+def get_admin():
+    admins = session.query(Admin).all()
+    return [{'id': admin.id, 'username': admin.username, 'is_superadmin': admin.is_superadmin} for admin in admins]
 
 def authenticate_admin(username, password):
     admin = session.query(Admin).filter_by(username=username).first()
@@ -158,24 +130,13 @@ def authenticate_super_admin(username):
     admin = get_admin()
     return admin and admin.is_superadmin
 
-
 def remove_admin(username):
-    session = Session()
-    # Получаем экземпляр администратора по имени пользователя
-    admin = session.query(Admin).filter_by(username=username).first()
+    admin = get_admin(username)
     if admin:
-        try:
-            session.delete(admin)
-            session.commit()
-            return True
-        except Exception as e:
-            session.rollback()
-            print(f"Ошибка при удалении администратора: {e}")
-            return False
-    else:
-        # Администратор с таким именем пользователя не найден
-        return False
-
+        session.delete(admin)
+        session.commit()
+        return True
+    return False
 
 def export_clients_to_csv(file_path='clients.csv'):
     clients = session.query(Client).all()
