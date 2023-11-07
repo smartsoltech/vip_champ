@@ -4,6 +4,7 @@ from db import get_or_create_client, get_settings, get_all_clients, export_clien
 from kb import generate_contact_keyboard, generate_admin_keyboard
 import os, csv, io
 from dotenv import load_dotenv
+from icecream import ic
 load_dotenv()
 
 MASTERADMIN_LOGIN = os.getenv('MASTERADMIN_LOGIN')
@@ -148,30 +149,7 @@ def setup_bot_handlers(bot):
         msg = bot.send_message(message.chat.id, "Введите логин и пароль мастер-админа:")
         bot.register_next_step_handler(msg, process_export_clients)
 
-    def process_export_clients(message):
-        # Создаем объект StringIO для хранения данных CSV
-        clients_csv = io.StringIO()
-        writer = csv.writer(clients_csv)
 
-        # Записываем заголовки столбцов
-        writer.writerow(['First Name', 'Last Name', 'Chat ID'])
-
-        # Получаем данные клиентов из базы данных
-        clients = get_all_clients()  # Эта функция должна возвращать список словарей клиентов
-
-        # Записываем данные клиентов
-        for client in clients:
-            # Используем ключи словаря для доступа к данным
-            writer.writerow([client['first_name'], client['last_name'], client['chat_id']])
-
-        # Перемещаем указатель в начало файла
-        clients_csv.seek(0)
-
-        # Отправляем файл
-        bot.send_document(message.chat.id, ('clients.csv', clients_csv.getvalue().encode('utf-8-sig')), caption='Вот список клиентов!')
-
-        # Не забудьте закрыть StringIO объект после использования
-        clients_csv.close()
         
         
     # Обработчик команды для получения списка админов
@@ -203,12 +181,14 @@ def setup_bot_handlers(bot):
             login, password = message.text.split()
             if check_masteradmin_credentials(login, password):
                 settings = get_settings()
+                ic(settings)
                 for setting in settings:
                     # Отправка настроек пользователю
                     bot.send_message(message.chat.id, f"{setting['name']}: {setting['value']}")
             else:
                 bot.send_message(message.chat.id, "Неверный логин или пароль.")
         except ValueError:
+            ic(ValueError)
             bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
             
     # стандартный ответ на неизвестные запросы - это самый посследний хэндлер. все хэндлеры ниже него работать не будут!!!!

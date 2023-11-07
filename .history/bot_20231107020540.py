@@ -1,9 +1,10 @@
 from telebot import TeleBot, types
 from db import set_setting, get_setting, get_admin, add_admin, remove_admin, authenticate_admin, authenticate_super_admin
-from db import get_or_create_client, get_settings, get_all_clients, export_clients_to_csv, is_admin
+from db import get_or_create_client, init_db, get_all_clients
 from kb import generate_contact_keyboard, generate_admin_keyboard
-import os, csv, io
+import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
 MASTERADMIN_LOGIN = os.getenv('MASTERADMIN_LOGIN')
@@ -140,77 +141,8 @@ def setup_bot_handlers(bot):
         except Exception as e:
             bot.reply_to(message, f"Произошла ошибка: {e}")
 
-    def check_masteradmin_credentials(login, password):
-        return login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD
 
-    @bot.message_handler(commands=['export_clients'])
-    def handle_export_clients_command(message):
-        msg = bot.send_message(message.chat.id, "Введите логин и пароль мастер-админа:")
-        bot.register_next_step_handler(msg, process_export_clients)
-
-    def process_export_clients(message):
-        # Создаем объект StringIO для хранения данных CSV
-        clients_csv = io.StringIO()
-        writer = csv.writer(clients_csv)
-
-        # Записываем заголовки столбцов
-        writer.writerow(['First Name', 'Last Name', 'Chat ID'])
-
-        # Получаем данные клиентов из базы данных
-        clients = get_all_clients()  # Эта функция должна возвращать список словарей клиентов
-
-        # Записываем данные клиентов
-        for client in clients:
-            # Используем ключи словаря для доступа к данным
-            writer.writerow([client['first_name'], client['last_name'], client['chat_id']])
-
-        # Перемещаем указатель в начало файла
-        clients_csv.seek(0)
-
-        # Отправляем файл
-        bot.send_document(message.chat.id, ('clients.csv', clients_csv.getvalue().encode('utf-8-sig')), caption='Вот список клиентов!')
-
-        # Не забудьте закрыть StringIO объект после использования
-        clients_csv.close()
-        
-        
-    # Обработчик команды для получения списка админов
-    @bot.message_handler(commands=['get_admins'])
-    def handle_get_admins_command(message):
-        msg = bot.send_message(message.chat.id, "Введите логин и пароль мастер-админа:")
-        bot.register_next_step_handler(msg, process_get_admins)
-
-    def process_get_admins(message):
-        try:
-            login, password = message.text.split()
-            if check_masteradmin_credentials(login, password):
-                admins_list = get_admin()
-                # Отправка списка админов пользователю
-                bot.send_message(message.chat.id, f'Список админов: {admins_list}')
-            else:
-                bot.send_message(message.chat.id, "Неверный логин или пароль.")
-        except ValueError:
-            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
-
-    # Обработчик команды для получения настроек
-    @bot.message_handler(commands=['get_settings'])
-    def handle_get_settings_command(message):
-        msg = bot.send_message(message.chat.id, "Введите логин и пароль мастер-админа:")
-        bot.register_next_step_handler(msg, process_get_settings)
-
-    def process_get_settings(message):
-        try:
-            login, password = message.text.split()
-            if check_masteradmin_credentials(login, password):
-                settings = get_settings()
-                for setting in settings:
-                    # Отправка настроек пользователю
-                    bot.send_message(message.chat.id, f"{setting['name']}: {setting['value']}")
-            else:
-                bot.send_message(message.chat.id, "Неверный логин или пароль.")
-        except ValueError:
-            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
-            
+                    
     # стандартный ответ на неизвестные запросы - это самый посследний хэндлер. все хэндлеры ниже него работать не будут!!!!
     @bot.message_handler(func=lambda message: True)
     def handle_message(message):

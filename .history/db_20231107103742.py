@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker, scoped_session, joinedload
 from sqlalchemy.exc import IntegrityError
 from contextlib import contextmanager
 import os
+from icecream import ic
 
 DATABASE_URL = "sqlite:///./db/settings.db" # Используйте ваш путь к файлу базы данных
 engine = create_engine(DATABASE_URL)
@@ -77,6 +78,7 @@ def get_setting(name):
 
 def get_settings():
     settings = session.query(Setting).all()
+    ic(settings)
     return [{'name': setting.name, 'value': setting.value} for setting in settings] if settings else None
 
 def set_setting(name, value):

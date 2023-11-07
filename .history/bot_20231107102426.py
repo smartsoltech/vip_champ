@@ -2,8 +2,9 @@ from telebot import TeleBot, types
 from db import set_setting, get_setting, get_admin, add_admin, remove_admin, authenticate_admin, authenticate_super_admin
 from db import get_or_create_client, get_settings, get_all_clients, export_clients_to_csv, is_admin
 from kb import generate_contact_keyboard, generate_admin_keyboard
-import os, csv, io
+import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
 MASTERADMIN_LOGIN = os.getenv('MASTERADMIN_LOGIN')
@@ -149,29 +150,18 @@ def setup_bot_handlers(bot):
         bot.register_next_step_handler(msg, process_export_clients)
 
     def process_export_clients(message):
-        # Создаем объект StringIO для хранения данных CSV
-        clients_csv = io.StringIO()
-        writer = csv.writer(clients_csv)
+        try:
+            login, password = message.text.split()
+            if check_masteradmin_credentials(login, password):
+                # Пароль верный, выполняем экспорт клиентов
+                clients_csv = export_clients_to_csv()
+                bot.send_document(message.chat.id, ('clients.csv', clients_csv.getvalue().encode('utf-8')), caption='Here is the list of all clients.')
+                bot.send_message(message.chat.id, "Экспорт клиентов выполнен.")
+            else:
+                bot.send_message(message.chat.id, "Неверный логин или пароль.")
+        except ValueError:
+            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
 
-        # Записываем заголовки столбцов
-        writer.writerow(['First Name', 'Last Name', 'Chat ID'])
-
-        # Получаем данные клиентов из базы данных
-        clients = get_all_clients()  # Эта функция должна возвращать список словарей клиентов
-
-        # Записываем данные клиентов
-        for client in clients:
-            # Используем ключи словаря для доступа к данным
-            writer.writerow([client['first_name'], client['last_name'], client['chat_id']])
-
-        # Перемещаем указатель в начало файла
-        clients_csv.seek(0)
-
-        # Отправляем файл
-        bot.send_document(message.chat.id, ('clients.csv', clients_csv.getvalue().encode('utf-8-sig')), caption='Вот список клиентов!')
-
-        # Не забудьте закрыть StringIO объект после использования
-        clients_csv.close()
         
         
     # Обработчик команды для получения списка админов
@@ -203,14 +193,13 @@ def setup_bot_handlers(bot):
             login, password = message.text.split()
             if check_masteradmin_credentials(login, password):
                 settings = get_settings()
-                for setting in settings:
+                for id, name, value in settings:
                     # Отправка настроек пользователю
-                    bot.send_message(message.chat.id, f"{setting['name']}: {setting['value']}")
+                    bot.send_message(message.chat.id, f'{"name": setting.name, "value": setting.value for setting in settings}')
             else:
                 bot.send_message(message.chat.id, "Неверный логин или пароль.")
         except ValueError:
-            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
-            
+            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")            
     # стандартный ответ на неизвестные запросы - это самый посследний хэндлер. все хэндлеры ниже него работать не будут!!!!
     @bot.message_handler(func=lambda message: True)
     def handle_message(message):

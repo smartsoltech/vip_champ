@@ -41,8 +41,8 @@ def init_db():
     
 def get_all_clients():
     with session_scope() as session:
-        clients = session.query(Client.first_name, Client.last_name, Client.chat_id).filter_by(is_bot=False).all()
-        return [{'first_name': client.first_name, 'last_name':client.last_name, 'chat_id': client.chat_id} for client in clients]
+        clients = session.query(Client.first_name, Client.chat_id).filter_by(is_bot=False).all()
+        return [{'first_name': client.first_name, 'chat_id': client.chat_id} for client in clients]
     
 def get_or_create_client(chat_id, first_name, last_name, is_bot):
     with session_scope() as session:
@@ -76,8 +76,8 @@ def get_setting(name):
     return instance.value if instance else None
 
 def get_settings():
-    settings = session.query(Setting).all()
-    return [{'name': setting.name, 'value': setting.value} for setting in settings] if settings else None
+    instance = session.query(Setting).all()
+    return [{'name': setting.name, 'Value': setting.value} for setting in Setting] if instance else None
 
 def set_setting(name, value):
     instance = session.query(Setting).filter_by(name=name).first()

@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker, scoped_session, joinedload
 from sqlalchemy.exc import IntegrityError
 from contextlib import contextmanager
 import os
+from icecream import ic
 
 DATABASE_URL = "sqlite:///./db/settings.db" # Используйте ваш путь к файлу базы данных
 engine = create_engine(DATABASE_URL)
@@ -41,8 +42,8 @@ def init_db():
     
 def get_all_clients():
     with session_scope() as session:
-        clients = session.query(Client.first_name, Client.last_name, Client.chat_id).filter_by(is_bot=False).all()
-        return [{'first_name': client.first_name, 'last_name':client.last_name, 'chat_id': client.chat_id} for client in clients]
+        clients = session.query(Client.first_name, Client.chat_id).filter_by(is_bot=False).all()
+        return [{'first_name': client.first_name, 'chat_id': client.chat_id} for client in clients]
     
 def get_or_create_client(chat_id, first_name, last_name, is_bot):
     with session_scope() as session:
@@ -77,6 +78,7 @@ def get_setting(name):
 
 def get_settings():
     settings = session.query(Setting).all()
+    ic(settings)
     return [{'name': setting.name, 'value': setting.value} for setting in settings] if settings else None
 
 def set_setting(name, value):

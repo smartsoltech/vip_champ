@@ -41,8 +41,8 @@ def init_db():
     
 def get_all_clients():
     with session_scope() as session:
-        clients = session.query(Client.first_name, Client.last_name, Client.chat_id).filter_by(is_bot=False).all()
-        return [{'first_name': client.first_name, 'last_name':client.last_name, 'chat_id': client.chat_id} for client in clients]
+        clients = session.query(Client.first_name, Client.chat_id).filter_by(is_bot=False).all()
+        return [{'first_name': client.first_name, 'chat_id': client.chat_id} for client in clients]
     
 def get_or_create_client(chat_id, first_name, last_name, is_bot):
     with session_scope() as session:
@@ -75,10 +75,6 @@ def get_setting(name):
     instance = session.query(Setting).filter_by(name=name).first()
     return instance.value if instance else None
 
-def get_settings():
-    settings = session.query(Setting).all()
-    return [{'name': setting.name, 'value': setting.value} for setting in settings] if settings else None
-
 def set_setting(name, value):
     instance = session.query(Setting).filter_by(name=name).first()
     if instance:
@@ -108,9 +104,8 @@ def add_admin(username, is_superadmin=False):
         session.rollback()
         return False
 
-def get_admin():
-    admins = session.query(Admin).all()
-    return [{'id': admin.id, 'username': admin.username, 'is_superadmin': admin.is_superadmin} for admin in admins]
+def get_admin(username):
+    return session.query(Admin).filter_by(username=username).first()
 
 def authenticate_admin(username):
     admin = get_admin(username)
@@ -128,29 +123,21 @@ def remove_admin(username):
         return True
     return False
 
-# def export_clients_to_csv():
-#     # Замените следующую строку на запрос к вашей базе данных для получения данных клиентов
-#     clients = session.query(Client).all()  # Это пример, используйте вашу сессию и модель
-#     output = StringIO()
-#     writer = csv.writer(output)
+def export_clients_to_csv():
+    # Замените следующую строку на запрос к вашей базе данных для получения данных клиентов
+    clients = session.query(Client).all()  # Это пример, используйте вашу сессию и модель
+    output = StringIO()
+    writer = csv.writer(output)
 
-#     # Запись заголовков CSV
-#     writer.writerow(['ID', 'First Name', 'Last Name', 'Chat ID'])
+    # Запись заголовков CSV
+    writer.writerow(['ID', 'First Name', 'Last Name', 'Chat ID'])
 
-#     # Запись данных клиентов
-#     for client in clients:
-#         writer.writerow([client.id, client.first_name, client.last_name, client.chat_id])
+    # Запись данных клиентов
+    for client in clients:
+        writer.writerow([client.id, client.first_name, client.last_name, client.chat_id])
 
-#     output.seek(0)
-#     return output
-
-def export_clients_to_csv(file_path='clients.csv'):
-    clients = session.query(Client).all()
-    with open(file_path, mode='w', newline='', encoding='utf-8-sig') as file:
-        writer = csv.writer(file)
-        writer.writerow(['ID', 'First Name', 'Last Name', 'Chat ID'])
-        for client in clients:
-            writer.writerow([client.id, client.first_name, client.last_name, client.chat_id])
+    output.seek(0)
+    return output
 
 # Функция для проверки, является ли пользователь администратором
 def is_admin(user_id):
