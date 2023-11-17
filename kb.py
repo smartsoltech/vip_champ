@@ -44,11 +44,13 @@ def generate_admin_inline_keyboard():
     add_admin_button = types.InlineKeyboardButton(text="➕ Добавить админа", callback_data="add_admin")
     remove_admin_button = types.InlineKeyboardButton(text="➖ Удалить админа", callback_data="remove_admin")
     send_all_button = types.InlineKeyboardButton(text="📨 Отправить всем", callback_data="send_all")
+    import_clients_button = types.InlineKeyboardButton(text="📨 Импорт клиентов", callback_data="import_clients")
 
     # Добавляем кнопки на клавиатуру в два ряда
     keyboard.row(change_manager_contact_button, change_channel_link_button)
     keyboard.row(change_bot_link_button, export_clients_button)
     keyboard.row(get_admins_button, add_admin_button)
     keyboard.row(remove_admin_button, send_all_button)
+    keyboard.row(import_clients_button)
     
     return keyboard
