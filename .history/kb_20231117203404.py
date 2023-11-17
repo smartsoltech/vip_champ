@@ -51,6 +51,5 @@ def generate_admin_inline_keyboard():
     keyboard.row(change_bot_link_button, export_clients_button)
     keyboard.row(get_admins_button, add_admin_button)
     keyboard.row(remove_admin_button, send_all_button)
-    keyboard.row(import_clients_button)
     
     return keyboard

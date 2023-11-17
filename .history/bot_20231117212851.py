@@ -195,7 +195,6 @@ def setup_bot_handlers(bot):
 
             # Делаем бэкап текущей базы данных
             backup_database()
-
             imported_count = 0
             skipped_duplicates = 0
             imported_clients_info = []
@@ -216,8 +215,8 @@ def setup_bot_handlers(bot):
                 bot.send_message(chat_id, message_text)
             bot.send_message(chat_id, f"Импортировано клиентов: {imported_count}\nПропущено дубликатов: {skipped_duplicates}")
         except Exception as e:
-            bot.send_message(chat_id, f"Произошла ошибка: {e}")  
-                        
+            bot.send_message(chat_id, f"Произошла ошибка: {e}")
+                
     def check_masteradmin_credentials(login, password):
         return login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD
 

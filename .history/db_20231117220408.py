@@ -231,7 +231,7 @@ def add_client_from_csv_row(row):
         ic(new_client, chat_id, first_name, last_name)
         session.add(new_client)
         session.commit()
-        client_info = f"{row['mention']} {row['nickname']} (ID: {row['id']})"
+        client_info = f"{row['first_name']} {row['last_name']} (ID: {row['chat_id']})"
         ic(client_info)
         return True, client_info
     else:

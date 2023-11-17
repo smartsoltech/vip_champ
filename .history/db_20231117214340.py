@@ -216,23 +216,16 @@ def parse_nickname(nickname):
     return first_name, last_name
 
 def add_client_from_csv_row(row):
-     # Получаем значения из строки CSV
-    first_name = row.get('mention', '').strip()
-    last_name = row.get('nickname', '').strip()
-    chat_id = row.get('id', None)
-
-    # Проверяем, есть ли хотя бы одно из имен
-    if not first_name and not last_name:
-        return False, "Отсутствуют имя и фамилия"
+    chat_id = int(row['id'])
+    nickname = row['nickname']
+    first_name, last_name = parse_nickname(nickname)
 
     existing_client = session.query(Client).filter(Client.chat_id == chat_id).first()
     if not existing_client:
         new_client = Client(chat_id=chat_id, first_name=first_name, last_name=last_name)
-        ic(new_client, chat_id, first_name, last_name)
         session.add(new_client)
         session.commit()
-        client_info = f"{row['mention']} {row['nickname']} (ID: {row['id']})"
-        ic(client_info)
+        client_info = f"{row['first_name']} {row['last_name']} (ID: {row['chat_id']})"
         return True, client_info
     else:
         return False, None

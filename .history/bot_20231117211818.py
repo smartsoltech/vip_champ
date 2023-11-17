@@ -196,28 +196,18 @@ def setup_bot_handlers(bot):
             # Делаем бэкап текущей базы данных
             backup_database()
 
-            imported_count = 0
-            skipped_duplicates = 0
-            imported_clients_info = []
-
             with open("temp.csv", 'r', encoding='UTF-8') as csvfile:
                 reader = csv.DictReader(csvfile)
                 for row in reader:
-                    result, client_info = add_client_from_csv_row(row)
-                    if result:
-                        imported_count += 1
-                        imported_clients_info.append(client_info)
-                    else:
-                        skipped_duplicates += 1
+                    response = add_client_from_csv_row(row)
+                    bot.send_message(chat_id, response)
 
             os.remove("temp.csv")
-            if imported_clients_info:
-                message_text = "Импортированные клиенты:\n" + "\n".join(imported_clients_info)
-                bot.send_message(chat_id, message_text)
-            bot.send_message(chat_id, f"Импортировано клиентов: {imported_count}\nПропущено дубликатов: {skipped_duplicates}")
+            bot.send_message(chat_id, "Импорт завершен.")
+
         except Exception as e:
-            bot.send_message(chat_id, f"Произошла ошибка: {e}")  
-                        
+            bot.send_message(chat_id, f"Произошла ошибка: {e}")
+            
     def check_masteradmin_credentials(login, password):
         return login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD
 
