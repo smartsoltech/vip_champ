@@ -135,10 +135,24 @@ def setup_bot_handlers(bot):
     def process_send_all_message(message):
         text = message.text
         clients = get_all_clients()
+        total_clients = len(clients)
+        messages_sent = 0
+        messages_failed = 0
+
         for client_data in clients:
             personalized_message = f"Привет, {client_data['first_name']}!\n{text}"
-            bot.send_message(client_data['chat_id'], personalized_message)
-        bot.reply_to(message, "Сообщение отправлено всем клиентам.")
+            try:
+                bot.send_message(client_data['chat_id'], personalized_message)
+                messages_sent += 1
+            except Exception as e:
+                print(f"Ошибка при отправке сообщения: {e}")
+                messages_failed += 1
+
+        report = (f"Всего клиентов: {total_clients}\n"
+                f"Отправлено сообщений: {messages_sent}\n"
+                f"Не отправлено: {messages_failed}")
+        bot.reply_to(message, report)
+
   # получение списка админов   
     def process_get_admins_login(message):
         admins_list = get_all_admin()
