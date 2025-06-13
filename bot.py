@@ -15,7 +15,7 @@ MASTERADMIN_PASSWORD = os.getenv('MASTERADMIN_PASSWORD')
 def setup_icecream():
     ic.configureOutput(includeContext=True)
     
-    
+ic.disable()   
 def setup_bot_handlers(bot):
     @bot.message_handler(commands=['start', 'help'])
     def send_welcome(message):
