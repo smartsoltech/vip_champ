@@ -4,7 +4,7 @@
 import sqlite3
 import csv
 import os
-
+from db import DATABASE_URL
 def csv_to_sqlite(csv_path: str, db_path: str, table_name: str = "clients"):
     # Создаём папку под БД, если нужно
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -44,6 +44,6 @@ def csv_to_sqlite(csv_path: str, db_path: str, table_name: str = "clients"):
     print(f"Импортировано {len(rows)} записей в {db_path} таблицу {table_name}.")
 
 if __name__ == "__main__":
-    csv_file = "clients.csv"     # путь к вашему CSV
-    sqlite_db = "db/settings.db"  # куда сохранить БД
+    csv_file = "clients.csv"     
+    sqlite_db = DATABASE_URL  
     csv_to_sqlite(csv_file, sqlite_db)
