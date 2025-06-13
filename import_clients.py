@@ -45,5 +45,5 @@ def csv_to_sqlite(csv_path: str, db_path: str, table_name: str = "clients"):
 
 if __name__ == "__main__":
     csv_file = "clients.csv"     # путь к вашему CSV
-    sqlite_db = "data/clients.db"  # куда сохранить БД
+    sqlite_db = "db/settings.db"  # куда сохранить БД
     csv_to_sqlite(csv_file, sqlite_db)
