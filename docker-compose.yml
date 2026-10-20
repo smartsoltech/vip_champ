@@ -1,6 +1,7 @@
 services:
   telegram-bot:
     image: ${APP_IMAGE:-vip-champ:${APP_REVISION:-development}}
+    pull_policy: never
     build:
       context: .
       args:

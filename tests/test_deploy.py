@@ -42,6 +42,9 @@ with Path(os.environ['MOCK_LOG']).open('a') as log:
                           'revision': os.environ.get('APP_REVISION')}) + '\\n')
 if args[0] == 'compose':
     if 'run' in args:
+        # The production Compose 2.26 CLI has --pull for up, but not run.
+        if '--pull' in args:
+            raise SystemExit(125)
         if args[-1] == 'scripts/preflight.py':
             print(720)
             if os.environ.get('MOCK_OPERATOR_EDIT'):

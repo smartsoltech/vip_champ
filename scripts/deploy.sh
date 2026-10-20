@@ -156,14 +156,14 @@ loaded_revision=$(docker image inspect "$image_id" --format '{{index .Config.Lab
   echo "CI image identity or revision mismatch" >&2; false;
 }
 # This authenticates getMe; it does not poll or consume updates from the old bot.
-if health_timeout=$(compose run --rm --no-deps --pull never --entrypoint python telegram-bot scripts/preflight.py); then
+if health_timeout=$(compose run --rm --no-deps --entrypoint python telegram-bot scripts/preflight.py); then
   :
 else
   exit "$?"
 fi
 [[ "$health_timeout" =~ ^[0-9]{3,9}$ ]] || { echo "Invalid candidate startup budget" >&2; false; }
 (( health_timeout >= 720 )) || health_timeout=720
-compose run --rm --no-deps --pull never --entrypoint python telegram-bot scripts/backup_database.py
+compose run --rm --no-deps --entrypoint python telegram-bot scripts/backup_database.py
 [[ "$(sha256sum "$shared_env" | cut -d ' ' -f 1)" = "$original_env_hash" ]] || {
   echo "External configuration changed during deployment; refusing to overwrite it." >&2; false;
 }
