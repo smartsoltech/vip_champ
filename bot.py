@@ -1,357 +1,672 @@
-from telebot import TeleBot, types
-from db import set_setting, get_setting, get_admin, add_admin, remove_admin, authenticate_admin, authenticate_super_admin
-from db import get_or_create_client, get_settings, get_all_clients, export_clients_to_csv, is_admin, get_all_admin
-from kb import generate_contact_keyboard, generate_admin_keyboard, generate_admin_inline_keyboard
-from db import Admin, session, add_client_from_csv_row, backup_database
-import os, csv, io
-from dotenv import load_dotenv
-from icecream import ic
-load_dotenv()
+"""Private administrative conversations and durable broadcasts."""
 
-MASTERADMIN_LOGIN = os.getenv('MASTERADMIN_LOGIN')
-MASTERADMIN_PASSWORD = os.getenv('MASTERADMIN_PASSWORD')
+import io
+import logging
+import re
+import secrets
+import threading
+import time
+from collections import defaultdict, deque
+from contextlib import contextmanager
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+from telebot import apihelper
+
+from kb import generate_admin_inline_keyboard, generate_contact_keyboard, normalize_telegram_url
+
+logger = logging.getLogger(__name__)
+MAX_TEXT_LENGTH = 4096
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+_SUPERADMIN_ACTIONS = {"add_admin", "add_superadmin", "remove_admin", "get_admins"}
+_SETTING_ACTIONS = {
+    "change_manager_contact": "manager_contact",
+    "change_channel_link": "channel_link",
+    "change_bot_link": "bot_link",
+}
+_INPUT_ACTIONS = set(_SETTING_ACTIONS) | {
+    "add_admin", "add_superadmin", "remove_admin", "send_all", "post_channel", "import_clients"
+}
+_ACTIONS = _INPUT_ACTIONS | {"get_admins", "export_clients", "get_settings", "check_admin"}
+_CONTENT_TYPES = [
+    "text", "document", "photo", "sticker", "voice", "audio", "video", "video_note",
+    "animation", "contact", "location", "venue", "dice",
+]
 
 
-def setup_icecream():
-    ic.configureOutput(includeContext=True)
-    
-ic.disable()   
-def setup_bot_handlers(bot):
-    @bot.message_handler(commands=['start', 'help'])
-    def send_welcome(message):
-        if message.from_user.is_bot:
-            bot.reply_to(message, "Мы не общаемся с ботами.")
-            return
+@dataclass
+class Conversation:
+    action: str
+    expires: float
 
-        client = get_or_create_client(
-            chat_id=message.chat.id,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
-            is_bot=message.from_user.is_bot
+
+@dataclass
+class Menu:
+    nonce: str
+    message_id: int
+    expires: float
+
+
+@dataclass(frozen=True)
+class AuthSession:
+    expires: float
+    auth_revision: str
+
+
+@dataclass(frozen=True)
+class PendingDelivery:
+    job_id: int
+    actor_id: int
+    chat_id: int
+    status: str
+    error: str | None
+    retry_after: float | None
+    attempt: int
+
+
+class BotApplication:
+    def __init__(self, bot, repository, settings, *, clock=time.monotonic):
+        self.bot = bot
+        self.repository = repository
+        self.settings = settings
+        self.clock = clock
+        self._states = {}
+        self._sessions = {}
+        self._menus = {}
+        self._attempts = defaultdict(deque)
+        self._global_attempts = deque()
+        self._lock = threading.RLock()
+        self._lifecycle_lock = threading.Lock()
+        self._conversation_locks = {}
+        self._broadcast_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._worker = None
+        self._notified_jobs = deque(maxlen=1024)
+        self._next_send_at = 0.0
+        self._pending_delivery = None
+        self.bot.message_handler(content_types=_CONTENT_TYPES)(self.handle_message)
+        self.bot.callback_query_handler(func=lambda call: True)(self.handle_callback)
+
+    @staticmethod
+    def _private(message, user=None):
+        user = user or getattr(message, "from_user", None)
+        chat = getattr(message, "chat", None)
+        return (
+            user is not None
+            and not getattr(user, "is_bot", False)
+            and chat is not None
+            and getattr(chat, "type", None) == "private"
+            and chat.id == user.id
         )
-        if client:
-            bot.reply_to(message, "Выберите опцию:", reply_markup=generate_contact_keyboard())
-        else:
-            bot.reply_to(message, "Произошла ошибка при сохранении данных.")
-            
-    @bot.message_handler(commands=['settings'])
-    def settings_command(message):
-        msg = bot.reply_to(message, "Введите логин и пароль через пробел:")
-        bot.register_next_step_handler(msg, process_login_step)
-        ic(msg)
-        
-    def process_login_step(message):
-        try:
-            username, password = message.text.split()
-            if authenticate_admin(username, password):
-                bot.send_message(message.chat.id, "Authentication successful!")
-                bot.reply_to(message, 'choose operation', reply_markup = generate_admin_inline_keyboard())
-                ic(username, password, authenticate_admin(username, password))
-                # Here you can call the function to generate the admin keyboard
-            else:
-                bot.send_message(message.chat.id, "Invalid login or password.")
-                ic(username, password, authenticate_admin(username, password))
-                ic(get_admin())
-        except Exception as e:
-            bot.reply_to(message, "Error in input. Please enter login and password separated by space.")
-            ic(e)
-                   
-  ##### обработкам callback админских кнопок
-  
-    @bot.callback_query_handler(func=lambda call: True)
-    def handle_callback_query(call):
-        if call.data == "change_manager_contact":
-            msg = bot.send_message(call.message.chat.id, "Отправьте новый контакт менеджера.")
-            bot.register_next_step_handler(msg, process_manager_contact)
-            ic(call.data)
-        elif call.data == "change_channel_link":
-            msg = bot.send_message(call.message.chat.id, "Отправьте новую ссылку на канал.")
-            bot.register_next_step_handler(msg, process_channel_link)
-            ic(call.data)
-        elif call.data == "change_bot_link":
-            msg = bot.send_message(call.message.chat.id, "Отправьте новую ссылку на бота.")
-            bot.register_next_step_handler(msg, process_bot_link)
-            ic(call.data)
-        elif call.data == "remove_admin":
-            msg = bot.send_message(call.message.chat.id, "Введите логин админа для удаления:")
-            bot.register_next_step_handler(msg, process_remove_admin)
-            ic(call.data)
-        elif call.data == "check_admin":
-            process_check_admin(call.message)
-            ic(call.data)
-        elif call.data == 'get_admins':
-            msg = bot.send_message(call.message.chat.id, "Введите логин и пароль через пробел для аутентификации:")
-            bot.register_next_step_handler(msg, process_get_admins_login)
-            ic(call.data)
-        elif call.data == 'export_clients':
-            msg = bot.send_message(call.message.chat.id, "Требуется авторизаци. Введите логин и пароль администратора:")
-            bot.register_next_step_handler(msg, process_export_clients)
-            ic(call.data)
-        elif call.data == "send_all":
-            msg = bot.send_message(call.message.chat.id, "Введите сообщение для отправки всем клиентам:")
-            bot.register_next_step_handler(msg, process_send_all_message)
-            ic(call.data)
-        elif call.data == "import_clients":
-            msg = bot.send_message(call.message.chat.id, "Пожалуйста, отправьте файл в формате CSV.")
-            bot.register_next_step_handler(msg, handle_document)
-            ic(call.data)
-        ic(call.data)
-        bot.answer_callback_query(call.id)
-        
-    # Не забудьте всегда отвечать на callback, чтобы убрать часы загрузки на кнопке
-        bot.answer_callback_query(call.id)
-  # обработка действий по inline клаве
-  # смена контакта менеджера
-    def process_manager_contact(message):
-        set_setting('manager_contact', message.text)
-        bot.send_message(message.chat.id, "Контакт менеджера успешно обновлен.", reply_markup = generate_admin_inline_keyboard())
-  # смена ссылки на канал
-    def process_channel_link(message):
-        set_setting('channel_link', message.text)
-        bot.send_message(message.chat.id, "Ссылка на канал успешно обновлена.", reply_markup = generate_admin_inline_keyboard())
-  # смена ссылки на бота
-    def process_bot_link(message):
-        set_setting('bot_link', message.text)
-        bot.send_message(message.chat.id, "Ссылка на бота успешно обновлена.", reply_markup = generate_admin_inline_keyboard())
-  # удаление админа
-    def process_remove_admin(message):
-        username = message.text.strip()
-        if remove_admin(username):
-            bot.send_message(message.chat.id, f"Админ {username} успешно удален.", reply_markup = generate_admin_inline_keyboard())
-        else:
-            bot.send_message(message.chat.id, "Не удалось удалить админа.")
-  #  проверка админа
-    def process_check_admin(message):
-        username = message.from_user.username
-        if authenticate_admin(username):
-            if authenticate_super_admin(username):
-                status = "супер-админ"
-            else:
-                status = "админ"
-            bot.send_message(message.chat.id, f"Вы являетесь {status}.")
-        else:
-            bot.send_message(message.chat.id, "Вы не являетесь администратором.")
-  # рассылка сообщения клиентам
-    def process_send_all_message(message):
-        text = message.text
-        clients = get_all_clients()
-        total_clients = len(clients)
-        messages_sent = 0
-        messages_failed = 0
 
-        for client_data in clients:
-            personalized_message = f"Привет, {client_data['first_name']}!\n{text}"
+    def _send(self, chat_id, text, **kwargs):
+        return self.bot.send_message(chat_id, text, **kwargs)
+
+    def _safe_notice(self, chat_id, text):
+        try:
+            self._send(chat_id, text)
+        except Exception as error:  # noqa: BLE001 - contain transport errors without logging request data.
+            logger.warning("Notification failed (%s)", type(error).__name__)
+
+    def _key(self, message):
+        return message.chat.id, message.from_user.id
+
+    @contextmanager
+    def _conversation(self, key):
+        """Serialize one user's input without blocking another user's I/O."""
+        with self._lock:
+            entry = self._conversation_locks.get(key)
+            if entry is None:
+                entry = [threading.RLock(), 0]
+                self._conversation_locks[key] = entry
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._lock:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    self._conversation_locks.pop(key, None)
+
+    def _pop_state(self, key):
+        with self._lock:
+            self._states.pop(key, None)
+
+    def _clear(self, key):
+        with self._lock:
+            self._states.pop(key, None)
+            self._menus.pop(key, None)
+
+    def _cleanup(self):
+        with self._lock:
+            now = self.clock()
+            for collection in (self._states, self._menus):
+                for key, value in list(collection.items()):
+                    if value.expires <= now:
+                        collection.pop(key, None)
+            for key, session in list(self._sessions.items()):
+                if session.expires <= now:
+                    self._sessions.pop(key, None)
+                    self._clear(key)
+            oldest = now - self.settings.auth_window_seconds
+            for user_id, attempts in list(self._attempts.items()):
+                while attempts and attempts[0] <= oldest:
+                    attempts.popleft()
+                if not attempts:
+                    self._attempts.pop(user_id, None)
+            while self._global_attempts and self._global_attempts[0] <= oldest:
+                self._global_attempts.popleft()
+
+    def _set_state(self, message, action):
+        with self._lock:
+            self._states[self._key(message)] = Conversation(
+                action, self.clock() + self.settings.state_ttl_seconds
+            )
+
+    def _admin(self, message, *, superadmin=False):
+        key = self._key(message)
+        with self._lock:
+            session = self._sessions.get(key)
+        if not self._private(message) or session is None or session.expires <= self.clock():
+            self._clear(key)
+            self._safe_notice(message.chat.id, "Для управления войдите через /settings в личном чате.")
+            return None
+        admin = self.repository.get_admin_by_telegram_id(message.from_user.id)
+        if admin is None:
+            with self._lock:
+                self._sessions.pop(key, None)
+            self._clear(key)
+            self._safe_notice(message.chat.id, "Доступ отозван. Обратитесь к администратору.")
+            return None
+        if not secrets.compare_digest(session.auth_revision, admin.auth_revision):
+            with self._lock:
+                self._sessions.pop(key, None)
+            self._clear(key)
+            self._safe_notice(message.chat.id, "Данные доступа изменились. Войдите снова через /settings.")
+            return None
+        if superadmin and not admin.is_superadmin:
+            self._clear(key)
+            self._safe_notice(message.chat.id, "Эта операция доступна только суперадминистратору.")
+            return None
+        return admin
+
+    def _show_menu(self, message, admin=None):
+        admin = admin or self._admin(message)
+        if admin is None:
+            return
+        nonce = secrets.token_urlsafe(12)
+        sent = self._send(
+            message.chat.id, "Выберите действие:",
+            reply_markup=generate_admin_inline_keyboard(nonce, admin.is_superadmin),
+        )
+        with self._lock:
+            session = self._sessions.get(self._key(message))
+            self._menus[self._key(message)] = Menu(
+                nonce, sent.message_id,
+                min(self.clock() + self.settings.state_ttl_seconds, session.expires if session else 0),
+            )
+
+    def handle_message(self, message):
+        chat = getattr(message, "chat", None)
+        if chat is None:
+            return
+        user = getattr(message, "from_user", None)
+        with self._conversation((chat.id, getattr(user, "id", None))):
             try:
-                bot.send_message(client_data['chat_id'], personalized_message)
-                messages_sent += 1
-            except Exception as e:
-                print(f"Ошибка при отправке сообщения: {e}")
-                messages_failed += 1
+                self._cleanup()
+                self._handle_message(message)
+            except Exception as error:  # noqa: BLE001 - final handler boundary must not stop polling.
+                logger.warning("Message operation failed (%s)", type(error).__name__)
+                if getattr(message, "from_user", None):
+                    self._pop_state(self._key(message))
+                self._safe_notice(chat.id, "Не удалось выполнить операцию. Попробуйте позже.")
 
-        report = (f"Всего клиентов: {total_clients}\n"
-                f"Отправлено сообщений: {messages_sent}\n"
-                f"Не отправлено: {messages_failed}")
-        bot.reply_to(message, report)
-
-  # получение списка админов   
-    def process_get_admins_login(message):
-        admins_list = get_all_admin()
-        ic(admins_list)
-        # response = '\n'.join([f"{admin.username} (Суперадмин: {'Да' if admin.is_superadmin else 'Нет'})" for admin in admins_list])
-        response = '\n'.join([
-            f"{admin['username']} (Суперадмин: {'Да' if admin['is_superadmin'] else 'Нет'})" 
-            for admin in admins_list
-        ])
-        bot.send_message(message.chat.id, f'Список админов:\n{response}', reply_markup=generate_admin_inline_keyboard())
-
-   # экспорт клиентов в csv           
-    def process_export_clients(message):
-        # Создаем объект StringIO для хранения данных CSV
-        clients_csv = io.StringIO()
-        writer = csv.writer(clients_csv)
-
-        # Записываем заголовки столбцов
-        writer.writerow(['First Name', 'Last Name', 'Chat ID'])
-
-        # Получаем данные клиентов из базы данных
-        clients = get_all_clients()  # Эта функция должна возвращать список словарей клиентов
-
-        # Записываем данные клиентов
-        for client in clients:
-            # Используем ключи словаря для доступа к данным
-            writer.writerow([client['first_name'], client['last_name'], client['chat_id']])
-
-        # Перемещаем указатель в начало файла
-        clients_csv.seek(0)
-
-        # Отправляем файл
-        bot.send_document(message.chat.id, ('clients.csv', clients_csv.getvalue().encode('utf-8-sig')), caption='Вот список клиентов!')
-
-        # Не забудьте закрыть StringIO объект после использования
-        clients_csv.close()
-        
-    # импорт клиентов и бэкап базы           
-    def handle_document(message):
-        try:
-            chat_id = message.chat.id
-            document = message.document
-            if not document.file_name.endswith('.csv'):
-                bot.send_message(chat_id, "Файл не в формате CSV.")
-                return
-
-            file_info = bot.get_file(document.file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
-
-            with open("temp.csv", 'wb') as new_file:
-                new_file.write(downloaded_file)
-
-            bot.send_message(chat_id, "Файл получен, начинаю импорт...")
-
-            # Делаем бэкап текущей базы данных
-            backup_database()
-
-            imported_count = 0
-            skipped_duplicates = 0
-            imported_clients_info = []
-
-            with open("temp.csv", 'r', encoding='UTF-8') as csvfile:
-                reader = csv.DictReader(csvfile)
-                for row in reader:
-                    result, client_info = add_client_from_csv_row(row)
-                    if result:
-                        imported_count += 1
-                        imported_clients_info.append(client_info)
-                    else:
-                        skipped_duplicates += 1
-
-            os.remove("temp.csv")
-            if imported_clients_info:
-                message_text = "Импортированные клиенты:\n" + "\n".join(imported_clients_info)
-                bot.send_message(chat_id, message_text)
-            bot.send_message(chat_id, f"Импортировано клиентов: {imported_count}\nПропущено дубликатов: {skipped_duplicates}")
-        except Exception as e:
-            bot.send_message(chat_id, f"Произошла ошибка: {e}")  
-                        
-    def check_masteradmin_credentials(login, password):
-        return login == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD
-
-    # Обработчик команды для получения настроек
-    @bot.message_handler(commands=['get_settings'])
-    def handle_get_settings_command(message):
-        msg = bot.send_message(message.chat.id, "Введите логин и пароль через пробел для аутентификации:")
-        bot.register_next_step_handler(msg, process_get_settings_login)
-
-    def process_get_settings_login(message):
-        try:
-            username, password = message.text.split(' ', 1)
-            if authenticate_admin(username, password):
-                settings = get_settings()
-                for setting in settings:
-                    bot.send_message(message.chat.id, f"{setting['name']}: {setting['value']}")
-            else:
-                bot.send_message(message.chat.id, "Неверный логин или пароль.")
-        except ValueError:
-            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
-
-       
-    SUPERADMIN_USERNAME = os.getenv('MASTERADMIN_USERNAME')
-    SUPERADMIN_PASSWORD = os.getenv('MASTERADMIN_PASSWORD')
-
-    def is_superadmin(username, password):
-        return username == SUPERADMIN_USERNAME and password == SUPERADMIN_PASSWORD
-    ic(MASTERADMIN_LOGIN, MASTERADMIN_PASSWORD)
-    
-    @bot.message_handler(commands=['add_admin'])
-    def add_admin_command(message):
-        msg = bot.reply_to(message, "Введите логин и пароль через пробел для аутентификации:")
-        bot.register_next_step_handler(msg, process_add_admin_login)
-
-    def process_add_admin_login(message):
-        try:
-            username, password = message.text.split(' ', 1)
-            if username == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD:
-                msg = bot.reply_to(message, "Введите логин и пароль нового админа через пробел:")
-                bot.register_next_step_handler(msg, process_add_admin_data)
-            else:
-                bot.send_message(message.chat.id, "Неверный логин или пароль.")
-        except ValueError:
-            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
-
-    def process_add_admin_data(message):
-        try:
-            new_username, new_password = message.text.split(' ', 1)
-            if add_admin(new_username, new_password):
-                bot.send_message(message.chat.id, f"Админ {new_username} успешно добавлен.")
-                ic(add_admin(new_username, new_password))
-                ic(new_username, new_password)
-            else:
-                bot.send_message(message.chat.id, "Не удалось добавить админа.")
-                ic(new_username, new_password)
-                ic(new_username, new_password)
-
-        except ValueError:
-            bot.send_message(message.chat.id, "Введите логин и пароль нового админа через пробел.")
-            ic(ValueError)
-
-    # Обработчик для команды добавления суперадмина
-    @bot.message_handler(commands=['add_superadmin'])
-    def add_superadmin_command(message):
-        msg = bot.reply_to(message, "Введите логин и пароль через пробел для аутентификации:")
-        bot.register_next_step_handler(msg, process_add_superadmin_login)
-        
-    def process_add_superadmin_login(message):
-        try:
-            username, password = message.text.split(' ', 1)
-            
-            if username == MASTERADMIN_LOGIN and password == MASTERADMIN_PASSWORD:
-                ic(authenticate_admin(username, password))
-                msg = bot.reply_to(message, "Введите логин и пароль нового суперадмина через пробел:")
-                bot.register_next_step_handler(msg, process_add_superadmin_data)
-            else:
-                bot.send_message(message.chat.id, "Неверный логин или пароль.")
-                ic(username, password, authenticate_admin(username, password))
-        except ValueError:
-            bot.send_message(message.chat.id, "Введите логин и пароль через пробел.")
-            ic(ValueError)
-
-    def process_add_superadmin_data(message):
-        try:
-            new_username, new_password = message.text.split(' ', 1)
-            if add_admin(new_username, new_password, is_superadmin=True):
-                bot.send_message(message.chat.id, f"Суперадмин {new_username} успешно добавлен.")
-            else:
-                bot.send_message(message.chat.id, "Не удалось добавить суперадмина.")
-        except ValueError:
-            bot.send_message(message.chat.id, "Введите логин и пароль нового суперадмина через пробел.")
-            ic(ValueError)
-            
-    @bot.message_handler(commands=['post_channel'])
-    def post_to_channel_command(message):
-        msg = bot.reply_to(message, "Введите сообщение для отправки в канал:")
-        bot.register_next_step_handler(msg, send_post_to_channel)
-    # Функция для отправки сообщения в канал
-    def send_post_to_channel(message):
-        channel_id = '@online_vip_channel'  # Замените на ваш ID канала
-        text = message.text
-        # Отправляем сообщение в канал с клавиатурой
-        bot.send_message(channel_id, text, reply_markup=generate_contact_keyboard())
-        bot.send_message('-4051196644', text, reply_markup=generate_contact_keyboard())
-
-    # стандартный ответ на неизвестные запросы - это самый посследний хэндлер. все хэндлеры ниже него работать не будут!!!!
-    @bot.message_handler(func=lambda message: True)
-    def handle_message(message):
-        if message.from_user.is_bot:
-            bot.reply_to(message, "Мы не общаемся с ботами.")
+    def _handle_message(self, message):
+        if getattr(message, "from_user", None) is None or message.from_user.is_bot:
             return
+        text = getattr(message, "text", None)
+        command = None
+        if isinstance(text, str) and text.startswith("/"):
+            command = text.split(maxsplit=1)[0][1:].split("@", 1)[0].lower()
+        if not self._private(message):
+            if command in _ACTIONS | {"settings", "get_settings", "broadcast_status", "cancel"}:
+                self._safe_notice(message.chat.id, "Управление доступно только в личном чате с ботом.")
+            return
+        key = self._key(message)
+        if command in {"start", "help", "cancel"}:
+            self._clear(key)
+            if command == "cancel":
+                self._send(message.chat.id, "Действие отменено.")
+            else:
+                self.repository.get_or_create_client(
+                    chat_id=message.chat.id, first_name=message.from_user.first_name,
+                    last_name=message.from_user.last_name, is_bot=False,
+                )
+                markup = generate_contact_keyboard(self.repository.get_settings())
+                self._send(
+                    message.chat.id,
+                    "Выберите опцию:" if markup else "Контакты пока не настроены. Попробуйте позже.",
+                    reply_markup=markup,
+                )
+            return
+        if command == "settings":
+            self._clear(key)
+            with self._lock:
+                self._sessions.pop(key, None)
+            self._set_state(message, "login")
+            self._send(message.chat.id, "Введите логин и пароль через пробел. Отмена: /cancel.")
+            return
+        if command == "broadcast_status":
+            self._pop_state(key)
+            self._broadcast_status(message)
+            return
+        if command in _ACTIONS:
+            self._pop_state(key)
+            self._begin_action(message, command)
+            return
+        if command:
+            self._send(message.chat.id, "Неизвестная команда. /start — меню, /cancel — отмена.")
+            return
+        with self._lock:
+            state = self._states.get(key)
+        if state:
+            self._process_state(message, state)
+        elif text is not None:
+            self._send(message.chat.id, "Откройте /start для контактов или /settings для управления.")
 
-        client = get_or_create_client(
-            chat_id=message.chat.id,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
-            is_bot=message.from_user.is_bot
-        )
-        if client:
-            bot.reply_to(message, "Выберите опцию:", reply_markup=generate_contact_keyboard())
+    def handle_callback(self, call):
+        notice = None
+        message = getattr(call, "message", None)
+        user = getattr(call, "from_user", None)
+        key = (getattr(getattr(message, "chat", None), "id", None), getattr(user, "id", None))
+        with self._conversation(key):
+            try:
+                self._cleanup()
+                if message is None or not self._private(message, getattr(call, "from_user", None)):
+                    notice = "Откройте /settings в личном чате."
+                    return
+                user = call.from_user
+                key = (message.chat.id, user.id)
+                with self._lock:
+                    menu = self._menus.get(key)
+                parts = str(getattr(call, "data", "")).split(":", 2)
+                if (
+                    menu is None or len(parts) != 3 or parts[0] != "admin"
+                    or not secrets.compare_digest(parts[1], menu.nonce)
+                    or message.message_id != menu.message_id
+                    or parts[2] not in _ACTIONS
+                ):
+                    notice = "Это меню устарело. Откройте /settings."
+                    return
+                context = SimpleNamespace(
+                    chat=message.chat, from_user=user, message_id=message.message_id, text=None
+                )
+                self._pop_state(key)
+                self._begin_action(context, parts[2])
+            except Exception as error:  # noqa: BLE001 - callback boundary protects polling.
+                logger.warning("Callback operation failed (%s)", type(error).__name__)
+                notice = "Не удалось выполнить операцию."
+            finally:
+                try:
+                    self.bot.answer_callback_query(call.id, text=notice)
+                except Exception as error:  # noqa: BLE001 - acknowledgment failure is isolated.
+                    logger.warning("Callback acknowledgment failed (%s)", type(error).__name__)
+
+    def _begin_action(self, message, action):
+        admin = self._admin(message, superadmin=action in _SUPERADMIN_ACTIONS)
+        if admin is None:
+            return
+        if action in _SETTING_ACTIONS:
+            prompt = "Введите @username или ссылку https://t.me/username. Отмена: /cancel."
+        elif action in {"add_admin", "add_superadmin"}:
+            prompt = (
+                "Введите Telegram ID, логин и пароль нового администратора через пробел.\n"
+                "Пример: 123456789 manager длинный пароль\n"
+                "Пароль: не менее 12 символов. Отмена: /cancel."
+            )
+        elif action == "remove_admin":
+            prompt = "Введите логин администратора для удаления. Отмена: /cancel."
+        elif action == "send_all":
+            prompt = "Введите текст рассылки (1–4096 символов). Отмена: /cancel."
+        elif action == "post_channel":
+            if not self.settings.post_chat_ids:
+                self._send(message.chat.id, "Каналы публикации не настроены.")
+                return
+            prompt = "Введите текст публикации (1–4096 символов). Отмена: /cancel."
+        elif action == "import_clients":
+            prompt = "Отправьте CSV-файл UTF-8, не более 5 МБ. Отмена: /cancel."
         else:
-            bot.reply_to(message, "Произошла ошибка при сохранении данных.")
+            self._immediate_action(message, action, admin)
+            return
+        self._set_state(message, action)
+        self._send(message.chat.id, prompt)
 
+    def _immediate_action(self, message, action, admin):
+        if action == "get_settings":
+            values = self.repository.get_settings()
+            lines = [f"{name}: {value}" for name, value in sorted(values.items())]
+            self._send_chunks(message.chat.id, "\n".join(lines) if lines else "Настройки пока не заданы.")
+        elif action == "check_admin":
+            role = "суперадминистратор" if admin.is_superadmin else "администратор"
+            self._send(message.chat.id, f"Ваш доступ: {role}.")
+        elif action == "get_admins":
+            admins = self.repository.list_admins()
+            lines = [
+                f"{item.username} · ID {item.telegram_id or 'не привязан'} · "
+                f"{'суперадминистратор' if item.is_superadmin else 'администратор'}"
+                for item in admins
+            ]
+            self._send_chunks(message.chat.id, "\n".join(lines) if lines else "Администраторов нет.")
+        elif action == "export_clients":
+            document = io.BytesIO(self.repository.export_clients())
+            document.name = "clients.csv"
+            self.bot.send_document(message.chat.id, document, caption="Список клиентов.")
+        self._show_menu(message)
+
+    def _send_chunks(self, chat_id, text):
+        for offset in range(0, len(text), MAX_TEXT_LENGTH):
+            self._send(chat_id, text[offset : offset + MAX_TEXT_LENGTH])
+
+    def _delete_credentials(self, message):
+        try:
+            self.bot.delete_message(message.chat.id, message.message_id)
+        except Exception as error:  # noqa: BLE001 - deletion failure must not expose credentials.
+            logger.info("Credential message cleanup failed (%s)", type(error).__name__)
+
+    def _login(self, message):
+        text = getattr(message, "text", None)
+        if not isinstance(text, str):
+            self._send(message.chat.id, "Нужен текст: логин и пароль через пробел. Отмена: /cancel.")
+            return
+        self._delete_credentials(message)
+        now = self.clock()
+        user_id = message.from_user.id
+        with self._lock:
+            attempts = self._attempts[user_id]
+            limited = (
+                len(attempts) >= self.settings.auth_max_attempts
+                or len(self._global_attempts) >= self.settings.auth_global_max_attempts
+            )
+            if not limited:
+                attempts.append(now)
+                self._global_attempts.append(now)
+        if limited:
+            self._send(message.chat.id, "Слишком много попыток входа. Попробуйте позже.")
+            return
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2:
+            self._send(message.chat.id, "Введите логин и пароль через пробел. Отмена: /cancel.")
+            return
+        admin = self.repository.authenticate_admin(parts[0], parts[1], user_id)
+        if admin is None:
+            self._send(message.chat.id, "Неверные данные или аккаунт не разрешён для вашего Telegram ID.")
+            return
+        key = self._key(message)
+        with self._lock:
+            self._states.pop(key, None)
+            self._sessions[key] = AuthSession(now + self.settings.auth_ttl_seconds, admin.auth_revision)
+        self._show_menu(message, admin)
+
+    def _process_state(self, message, state):
+        if state.action == "login":
+            self._login(message)
+            return
+        admin = self._admin(message, superadmin=state.action in _SUPERADMIN_ACTIONS)
+        if admin is None:
+            return
+        if state.action == "import_clients":
+            self._import(message)
+            return
+        text = getattr(message, "text", None)
+        if not isinstance(text, str) or not text.strip():
+            self._send(message.chat.id, "Нужно текстовое сообщение. Отмена: /cancel.")
+            return
+        if state.action in _SETTING_ACTIONS:
+            try:
+                value = normalize_telegram_url(text)
+            except ValueError as error:
+                self._send(message.chat.id, str(error))
+                return
+            self.repository.set_setting(
+                _SETTING_ACTIONS[state.action], value, actor_id=message.from_user.id,
+                expected_auth_revision=admin.auth_revision,
+            )
+            self._send(message.chat.id, "Настройка сохранена.")
+        elif state.action in {"add_admin", "add_superadmin"}:
+            self._delete_credentials(message)
+            parts = text.split(maxsplit=2)
+            if (
+                len(parts) != 3 or not parts[0].isascii() or not parts[0].isdigit()
+                or int(parts[0]) <= 0 or int(parts[0]) >= 2**52
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{3,50}", parts[1])
+                or len(parts[2]) < 12
+            ):
+                self._send(
+                    message.chat.id,
+                    "Нужны положительный Telegram ID, логин (3–50 латинских символов, цифр, _.-) "
+                    "и пароль не короче 12 символов.",
+                )
+                return
+            try:
+                self.repository.add_admin(
+                    parts[1], parts[2], telegram_id=int(parts[0]),
+                    is_superadmin=state.action == "add_superadmin",
+                    actor_id=message.from_user.id, expected_auth_revision=admin.auth_revision,
+                )
+            except ValueError:
+                self._send(message.chat.id, "Не удалось добавить администратора: проверьте логин и Telegram ID.")
+                return
+            self._send(message.chat.id, "Администратор добавлен.")
+        elif state.action == "remove_admin":
+            try:
+                removed = self.repository.remove_admin(
+                    text.strip(), actor_id=message.from_user.id,
+                    expected_auth_revision=admin.auth_revision,
+                )
+            except ValueError:
+                self._send(message.chat.id, "Нельзя удалить эту запись: проверьте логин, права и наличие другого суперадминистратора.")
+                return
+            self._send(message.chat.id, "Администратор удалён." if removed else "Администратор не найден.")
+        elif state.action in {"send_all", "post_channel"}:
+            if len(text) > MAX_TEXT_LENGTH:
+                self._send(message.chat.id, "Текст слишком длинный: максимум 4096 символов.")
+                return
+            if state.action == "send_all":
+                job_id = self.repository.create_broadcast(
+                    message.from_user.id, text, expected_auth_revision=admin.auth_revision
+                )
+                self._wake.set()
+                self._send(
+                    message.chat.id,
+                    f"Рассылка №{job_id} поставлена в очередь. Статус: /broadcast_status {job_id}",
+                )
+            else:
+                self._post(message, text)
+        self._pop_state(self._key(message))
+        self._show_menu(message)
+
+    def _import(self, message):
+        document = getattr(message, "document", None)
+        if document is None or not str(getattr(document, "file_name", "")).lower().endswith(".csv"):
+            self._send(message.chat.id, "Пришлите файл с расширением .csv. Отмена: /cancel.")
+            return
+        size = getattr(document, "file_size", None)
+        if size is None or size <= 0 or size > MAX_IMPORT_BYTES:
+            self._send(message.chat.id, "Размер CSV должен быть от 1 байта до 5 МБ.")
+            return
+        file_info = self.bot.get_file(document.file_id)
+        content = self.bot.download_file(file_info.file_path)
+        if not isinstance(content, bytes) or len(content) > MAX_IMPORT_BYTES:
+            self._send(message.chat.id, "Файл превышает допустимый размер.")
+            return
+        admin = self._admin(message)
+        if admin is None:
+            return
+        try:
+            result = self.repository.import_clients(
+                content, actor_id=message.from_user.id, expected_auth_revision=admin.auth_revision
+            )
+        except ValueError:
+            self._send(message.chat.id, "CSV не принят. Проверьте UTF-8, заголовки и значения всех строк.")
+            return
+        self._pop_state(self._key(message))
+        self._send(
+            message.chat.id,
+            f"Импорт завершён. Добавлено: {result.inserted}; дубликатов: {result.duplicates}; строк: {result.total}.",
+        )
+        self._show_menu(message)
+
+    def _post(self, message, text):
+        markup = generate_contact_keyboard(self.repository.get_settings())
+        results = []
+        for chat_id in dict.fromkeys(self.settings.post_chat_ids):
+            if self._admin(message) is None:
+                break
+            status, _, _ = self._deliver(chat_id, text, reply_markup=markup)
+            labels = {"sent": "отправлено", "failed": "не отправлено", "pending": "отклонено: лимит Telegram", "uncertain": "результат неизвестен"}
+            results.append(f"{chat_id}: {labels[status]}")
+        self._send(message.chat.id, "Результат публикации:\n" + "\n".join(results))
+
+    @staticmethod
+    def _personalize(first_name, text):
+        personalized = f"Привет, {first_name or 'друг'}!\n{text}"
+        return personalized if len(personalized) <= MAX_TEXT_LENGTH else text
+
+    def _deliver(self, chat_id, text, **kwargs):
+        try:
+            self._send(chat_id, text, **kwargs)
+            return "sent", None, None
+        except apihelper.ApiTelegramException as error:
+            code = getattr(error, "error_code", None)
+            if code == 429:
+                parameters = (getattr(error, "result_json", None) or {}).get("parameters") or {}
+                try:
+                    retry_after = max(1, min(float(parameters.get("retry_after", 60)), 86400))
+                except (TypeError, ValueError):
+                    retry_after = 60
+                return "pending", "telegram_429", retry_after
+            return ("uncertain" if code is None or code >= 500 else "failed"), f"telegram_{code}", None
+        except Exception as error:  # noqa: BLE001 - an unknown transport result must never be retried.
+            # The server may have accepted the message before the connection failed.
+            return "uncertain", f"send_{type(error).__name__}", None
+
+    def _broadcast_status(self, message):
+        admin = self._admin(message)
+        if admin is None:
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].isascii() or not parts[1].isdigit():
+            self._send(message.chat.id, "Используйте /broadcast_status НОМЕР.")
+            return
+        try:
+            status = self.repository.get_broadcast_status(int(parts[1]))
+        except (ValueError, LookupError):
+            status = None
+        if not status or (status["actor_id"] != message.from_user.id and not admin.is_superadmin):
+            self._send(message.chat.id, "Рассылка не найдена или недоступна.")
+            return
+        self._send(message.chat.id, self._status_text(status))
+
+    @staticmethod
+    def _status_text(status):
+        return (
+            f"Рассылка №{status['id']} ({status['status']}):\n"
+            f"Ожидают: {status['pending']}; выполняются: {status['sending']}; "
+            f"отправлены: {status['sent']}; ошибки: {status['failed']}; "
+            f"результат неизвестен: {status['uncertain']}."
+        )
+
+    def process_broadcast_once(self):
+        """Process at most one durable recipient, including in deterministic offline tests."""
+        with self._broadcast_lock:
+            return self._process_broadcast_once()
+
+    def _process_broadcast_once(self):
+        if self._pending_delivery is not None:
+            self._persist_delivery()
+            return True
+        now = self.clock()
+        if now < self._next_send_at:
+            return False
+        for job in self.repository.pending_broadcasts():
+            if self.repository.get_admin_by_telegram_id(job["actor_id"]) is None:
+                self.repository.cancel_broadcast(job["id"])
+                continue
+            recipients = self.repository.get_broadcast_batch(job["id"], limit=1)
+            if not recipients:
+                continue
+            recipient = recipients[0]
+            if self.repository.get_admin_by_telegram_id(job["actor_id"]) is None:
+                self.repository.record_broadcast_result(
+                    job["id"], recipient["chat_id"], status="failed", error="actor_revoked",
+                    attempt=recipient["attempt"],
+                )
+                self.repository.cancel_broadcast(job["id"])
+                continue
+            status, error, retry_after = self._deliver(
+                recipient["chat_id"], self._personalize(recipient["first_name"], job["text"])
+            )
+            self._pending_delivery = PendingDelivery(
+                job["id"], job["actor_id"], recipient["chat_id"], status, error, retry_after,
+                recipient["attempt"],
+            )
+            self._next_send_at = self.clock() + max(
+                self.settings.broadcast_interval_seconds, retry_after or 0
+            )
+            self._persist_delivery()
+            return True
+        return False
+
+    def _persist_delivery(self):
+        outcome = self._pending_delivery
+        self.repository.record_broadcast_result(
+            outcome.job_id, outcome.chat_id, status=outcome.status, error=outcome.error,
+            retry_after=outcome.retry_after, attempt=outcome.attempt,
+        )
+        self._pending_delivery = None
+        progress = self.repository.get_broadcast_status(outcome.job_id)
+        if progress["pending"] == 0 and progress["sending"] == 0 and outcome.job_id not in self._notified_jobs:
+            self._notified_jobs.append(outcome.job_id)
+            self._safe_notice(outcome.actor_id, self._status_text(progress))
+
+    def _work(self):
+        while not self._stop.is_set():
+            try:
+                worked = self.process_broadcast_once()
+            except Exception as error:  # noqa: BLE001 - keep the worker alive; pending claims stay durable.
+                logger.warning("Broadcast worker operation failed (%s)", type(error).__name__)
+                worked = False
+            if not worked:
+                self._wake.wait(0.5)
+                self._wake.clear()
+            else:
+                self._stop.wait(self.settings.broadcast_interval_seconds)
+
+    def start(self):
+        with self._lifecycle_lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self.repository.recover_broadcasts()
+            self._stop.clear()
+            self._worker = threading.Thread(target=self._work, name="broadcast-worker", daemon=True)
+            self._worker.start()
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+        worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=10)
+
+
+def setup_bot_handlers(bot, repository=None, settings=None):
+    if settings is None:
+        from config import load_settings
+        settings = load_settings(require_token=False)
+    if repository is None:
+        from db import Repository
+        repository = Repository(settings.database_url, backup_dir=settings.backup_dir)
+        repository.initialize()
+    return BotApplication(bot, repository, settings)

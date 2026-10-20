@@ -1,56 +1,99 @@
+"""Telegram keyboards and contact validation. No database or environment side effects."""
+
+import re
+from collections.abc import Mapping
+from urllib.parse import urlsplit
+
 from telebot import types
-import os
-from db import get_setting
 
-def generate_contact_keyboard():
+_USERNAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{4,31}\Z")
+_INVITE = re.compile(r"(?:\+|joinchat/)[A-Za-z0-9_-]{8,128}\Z")
+
+
+def normalize_telegram_url(value: str) -> str:
+    """Accept a Telegram username or an HTTPS Telegram/invitation link."""
+    if not isinstance(value, str):
+        raise TypeError("Укажите Telegram username или ссылку https://t.me/username.")
+    value = value.strip()
+    if not value or any(character.isspace() for character in value):
+        raise ValueError("Ссылка не должна быть пустой или содержать пробелы.")
+    if value.startswith("@"):
+        path = value[1:]
+    elif value.startswith(("t.me/", "telegram.me/")):
+        path = value.split("/", 1)[1]
+    elif "://" in value:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc.lower() not in {"t.me", "telegram.me"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Разрешены ссылки https://t.me/username без дополнительных параметров.")
+        path = parsed.path.removeprefix("/").removesuffix("/")
+    else:
+        path = value
+    if not (_USERNAME.fullmatch(path) or _INVITE.fullmatch(path)):
+        raise ValueError("Укажите корректный Telegram username или ссылку-приглашение.")
+    return f"https://t.me/{path}"
+
+
+def generate_contact_keyboard(settings: Mapping[str, str] | None = None):
+    settings = settings or {}
     keyboard = types.InlineKeyboardMarkup()
-    # Получаем данные из базы данных
-    manager_contact = get_setting('manager_contact')
-    channel_link = get_setting('channel_link')
-    bot_link = get_setting('bot_link')
-    
-    # Создаем кнопки с полученными данными
-    deposit_button = types.InlineKeyboardButton(text="💰 Внести депозит", url=f'https://t.me/{manager_contact}')
-    contact_button = types.InlineKeyboardButton(text="🤝 Связаться с менеджером", url=f'https://t.me/{manager_contact}')
-    channel_button = types.InlineKeyboardButton(text="📢 Перейти в канал", url=f'https://t.me/{channel_link}')
-    chat_button = types.InlineKeyboardButton(text="💬 Перейти в чат розыгрыша", url=f'https://t.me/{bot_link}')
+    buttons = (
+        ("manager_contact", "💰 Внести депозит"),
+        ("manager_contact", "🤝 Связаться с менеджером"),
+        ("channel_link", "📢 Перейти в канал"),
+        ("bot_link", "💬 Перейти в чат розыгрыша"),
+    )
+    count = 0
+    for key, label in buttons:
+        try:
+            url = normalize_telegram_url(settings.get(key))
+        except (TypeError, ValueError):
+            continue
+        keyboard.row(types.InlineKeyboardButton(text=label, url=url))
+        count += 1
+    return keyboard if count else None
 
-    # Добавляем каждую кнопку в отдельный ряд
-    keyboard.row(deposit_button)
-    keyboard.row(contact_button)
-    keyboard.row(channel_button)
-    keyboard.row(chat_button)
+
+def generate_admin_inline_keyboard(nonce: str, is_superadmin: bool = False):
+    keyboard = types.InlineKeyboardMarkup()
+    actions = [
+        ("📞 Контакт менеджера", "change_manager_contact"),
+        ("🔗 Ссылка на канал", "change_channel_link"),
+        ("💬 Ссылка на чат", "change_bot_link"),
+        ("⚙️ Текущие настройки", "get_settings"),
+        ("📁 Экспорт клиентов", "export_clients"),
+        ("📥 Импорт клиентов", "import_clients"),
+        ("📨 Рассылка", "send_all"),
+        ("📢 Публикация", "post_channel"),
+        ("🔎 Мой доступ", "check_admin"),
+    ]
+    if is_superadmin:
+        actions.extend(
+            [
+                ("👥 Администраторы", "get_admins"),
+                ("➕ Добавить админа", "add_admin"),
+                ("➕ Добавить суперадмина", "add_superadmin"),
+                ("➖ Удалить админа", "remove_admin"),
+            ]
+        )
+    for index in range(0, len(actions), 2):
+        keyboard.row(
+            *[
+                types.InlineKeyboardButton(text=label, callback_data=f"admin:{nonce}:{action}")
+                for label, action in actions[index : index + 2]
+            ]
+        )
     return keyboard
 
-def generate_admin_keyboard(is_su):
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True, )
-    keyboard.add('Изменить контакт менеджера')
-    keyboard.add('Изменить ссылку на канал')
-    keyboard.add('Изменить ссылку на бота')
-    if os.getenv('IS_SUPERADMIN') == 'true' and is_su:  # Предполагаем, что у вас есть переменная окружения IS_SUPERADMIN
-        keyboard.add('Добавить админа')
-    return keyboard
 
-def generate_admin_inline_keyboard():
-    # Создаем клавиатуру без указания row_width, чтобы добавить кнопки индивидуально
-    keyboard = types.InlineKeyboardMarkup()
-
-    # Создаем кнопки
-    change_manager_contact_button = types.InlineKeyboardButton(text="📞 Изменить контакт менеджера", callback_data="change_manager_contact")
-    change_channel_link_button = types.InlineKeyboardButton(text="🔗 Изменить ссылку на канал", callback_data="change_channel_link")
-    change_bot_link_button = types.InlineKeyboardButton(text="🤖 Изменить ссылку на бота", callback_data="change_bot_link")
-    export_clients_button = types.InlineKeyboardButton(text="📁 Экспорт клиентов", callback_data="export_clients")
-    get_admins_button = types.InlineKeyboardButton(text="👥 Список админов", callback_data="get_admins")
-    add_admin_button = types.InlineKeyboardButton(text="➕ Добавить админа", callback_data="add_admin")
-    remove_admin_button = types.InlineKeyboardButton(text="➖ Удалить админа", callback_data="remove_admin")
-    send_all_button = types.InlineKeyboardButton(text="📨 Отправить всем", callback_data="send_all")
-    import_clients_button = types.InlineKeyboardButton(text="📨 Импорт клиентов", callback_data="import_clients")
-
-    # Добавляем кнопки на клавиатуру в два ряда
-    keyboard.row(change_manager_contact_button, change_channel_link_button)
-    keyboard.row(change_bot_link_button, export_clients_button)
-    keyboard.row(get_admins_button, add_admin_button)
-    keyboard.row(remove_admin_button, send_all_button)
-    keyboard.row(import_clients_button)
-    
+def generate_admin_keyboard(is_su=False):
+    """Compatibility helper; commands use the same authorization as inline actions."""
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    keyboard.add("/settings", "/cancel")
+    if is_su:
+        keyboard.add("/add_admin", "/add_superadmin")
     return keyboard

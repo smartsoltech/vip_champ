@@ -1,0 +1,77 @@
+kind: pipeline
+type: docker
+name: verify-and-deploy
+
+clone:
+  depth: 0
+
+concurrency:
+  limit: 1
+
+services:
+  - name: postgres
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vip_champ_test
+      POSTGRES_PASSWORD: test-only-password
+      POSTGRES_DB: vip_champ_test
+
+steps:
+  - name: verify
+    image: python:3.13-slim-trixie
+    environment:
+      TEST_DATABASE_URL: postgresql+psycopg://vip_champ_test:test-only-password@postgres:5432/vip_champ_test
+    commands:
+      - sh scripts/install_pg_client.sh
+      - apt-get install -y --no-install-recommends git
+      - export PATH=/usr/lib/postgresql/16/bin:$PATH
+      - pip install --require-hashes -r requirements-dev.txt
+      - python scripts/check_secrets.py --history
+      - ruff check .
+      - python -m pytest -q
+      - pip-audit --disable-pip --no-deps -r requirements.txt
+      - pip-audit --disable-pip --no-deps -r requirements-dev.txt
+
+  - name: build
+    image: plugins/docker
+    settings:
+      dry_run: true
+      repo: vip-champ
+      tags:
+        - ${DRONE_COMMIT_SHA}
+      build_args:
+        - APP_REVISION=${DRONE_COMMIT_SHA}
+    depends_on:
+      - verify
+
+  - name: deploy
+    image: alpine:3.22
+    environment:
+      DEPLOY_HOST:
+        from_secret: vip_champ_deploy_host
+      DEPLOY_USER:
+        from_secret: vip_champ_deploy_user
+      DEPLOY_SSH_KEY:
+        from_secret: vip_champ_deploy_key
+      DEPLOY_KNOWN_HOSTS:
+        from_secret: vip_champ_deploy_known_hosts
+      DEPLOY_PATH:
+        from_secret: vip_champ_deploy_path
+    commands:
+      - apk add --no-cache git openssh-client
+      - sh scripts/ci_deploy.sh
+    depends_on:
+      - build
+    when:
+      event:
+        - push
+      branch:
+        - master
+      repo:
+        - trevor/vip_champ
+
+trigger:
+  event:
+    - push
+    - pull_request
+    - custom

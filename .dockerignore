@@ -1,0 +1,15 @@
+**
+!requirements.txt
+!config.py
+!main.py
+!healthcheck.py
+!bot.py
+!kb.py
+!db.py
+!models.py
+!admin.py
+!import_clients.py
+!scripts/
+!scripts/install_pg_client.sh
+!scripts/backup_database.py
+!scripts/migrate_sqlite_to_postgres.py

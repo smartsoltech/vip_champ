@@ -1,76 +1,44 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Import a canonical or legacy UTF-8 CSV using the application's shared database."""
+from __future__ import annotations
 
-import sqlite3
-import csv
-import os
+import argparse
+import sys
+from pathlib import Path
 
-# Путь к входному CSV-файлу и к файлу SQLite
-CSV_FILE = "clients.csv"
-DB_FILE  = "./db/settings.db"
-TABLE    = "clients"
+from config import load_settings
+from db import MAX_CSV_BYTES, Repository
 
 
-def csv_to_sqlite(csv_path: str, db_path: str, table_name: str = TABLE):
-    # Создаём директорию под БД, если её нет
-    db_dir = os.path.dirname(db_path) or "."
-    os.makedirs(db_dir, exist_ok=True)
-
-    # Подключаемся к SQLite
-    conn = sqlite3.connect(db_path)
-    cur  = conn.cursor()
-
-    # Создаём таблицу, если ещё не существует
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            first_name TEXT,
-            last_name  TEXT,
-            chat_id    INTEGER PRIMARY KEY
-        );
-    """ )
-
-    rows = []
-    seen = set()  # для проверки дубликатов в CSV
-
-    # Открываем CSV с utf-8-sig, чтобы убрать BOM, если он есть
-    with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        # Диагностика заголовков (можно убрать после проверки)
-        print("DEBUG: detected columns:", reader.fieldnames)
-
-        for row in reader:
-            first = row.get("First Name", "").strip() or None
-            last  = row.get("Last Name", "").strip()  or None
-            chat  = row.get("Chat ID", "").strip()
-
-            # Пробуем преобразовать chat_id к целому, допускаем отрицательные числа
-            try:
-                chat_id = int(chat)
-            except (ValueError, TypeError):
-                print(f"Skipping invalid chat_id: {chat!r}")
-                continue
-
-            # Проверка дубликатов внутри CSV
-            if chat_id in seen:
-                print(f"Skipping duplicate chat_id in CSV: {chat_id}")
-                continue
-            seen.add(chat_id)
-
-            rows.append((first, last, chat_id))
-
-    # Вставляем все строки, игнорируя дубликаты в БД по chat_id
-    cur.executemany(
-        f"INSERT OR IGNORE INTO {table_name} (first_name, last_name, chat_id) VALUES (?, ?, ?);",
-        rows
-    )
-
-    conn.commit()
-    conn.close()
-    print(f"Imported {len(rows)} unique records into '{db_path}', table '{table_name}'.")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('csv_file', nargs='?', type=Path, default=Path('clients.csv'))
+    args = parser.parse_args(argv)
+    repository = None
+    try:
+        if args.csv_file.stat().st_size > MAX_CSV_BYTES:
+            raise ValueError('CSV must be at most 10 MiB.')
+        content = args.csv_file.read_bytes()
+        settings = load_settings(require_token=False)
+        repository = Repository(settings.database_url, backup_dir=settings.backup_dir)
+        report = repository.initialize()
+        if report.quarantined:
+            print(f'Migration quarantined {report.quarantined} legacy rows; inspect migration_quarantine.')
+        result = repository.import_clients(content)
+        print(f'Imported: {result.inserted}; duplicates: {result.duplicates}; input rows: {result.total}.')
+        return 0
+    except (ValueError, RuntimeError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except OSError:
+        print('Unable to read CSV or write the database backup.', file=sys.stderr)
+        return 1
+    except Exception:
+        print('Import failed; no imported rows were committed.', file=sys.stderr)
+        return 1
+    finally:
+        if repository:
+            repository.close()
 
 
-if __name__ == "__main__":
-    if not os.path.exists(CSV_FILE):
-        print(f"Error: CSV file '{CSV_FILE}' not found.")
-        exit(1)
-    csv_to_sqlite(CSV_FILE, DB_FILE)
+if __name__ == '__main__':
+    raise SystemExit(main())
