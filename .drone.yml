@@ -32,7 +32,7 @@ steps:
       - pip-audit --disable-pip --no-deps -r requirements.txt
       - pip-audit --disable-pip --no-deps -r requirements-dev.txt
 
-  - name: build
+  - name: build-preview
     image: plugins/docker
     settings:
       dry_run: true
@@ -43,6 +43,67 @@ steps:
         - APP_REVISION=${DRONE_COMMIT_SHA}
     depends_on:
       - verify
+    when:
+      event:
+        - pull_request
+        - custom
+
+  - name: build-branch
+    image: plugins/docker
+    settings:
+      dry_run: true
+      repo: vip-champ
+      tags:
+        - ${DRONE_COMMIT_SHA}
+      build_args:
+        - APP_REVISION=${DRONE_COMMIT_SHA}
+    depends_on:
+      - verify
+    when:
+      event:
+        - push
+      branch:
+        exclude:
+          - master
+
+  - name: build
+    image: plugins/docker
+    settings:
+      registry: git.smartsoltech.kr
+      repo: git.smartsoltech.kr/trevor/vip-champ
+      config:
+        from_secret: vip_champ_registry_config
+      tags:
+        - ${DRONE_COMMIT_SHA}
+      build_args:
+        - APP_REVISION=${DRONE_COMMIT_SHA}
+    depends_on:
+      - verify
+    when:
+      event:
+        - push
+      branch:
+        - master
+      repo:
+        - trevor/vip_champ
+
+  - name: export-image
+    image: alpine:3.22
+    environment:
+      REGISTRY_CONFIG:
+        from_secret: vip_champ_registry_config
+    commands:
+      - apk add --no-cache skopeo python3
+      - python3 scripts/export_image.py
+    depends_on:
+      - build
+    when:
+      event:
+        - push
+      branch:
+        - master
+      repo:
+        - trevor/vip_champ
 
   - name: deploy
     image: alpine:3.22
@@ -63,7 +124,7 @@ steps:
       - apk add --no-cache git openssh-client
       - sh scripts/ci_deploy.sh
     depends_on:
-      - build
+      - export-image
     when:
       event:
         - push

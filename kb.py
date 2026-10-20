@@ -97,3 +97,12 @@ def generate_admin_keyboard(is_su=False):
     if is_su:
         keyboard.add("/add_admin", "/add_superadmin")
     return keyboard
+
+
+def generate_confirmation_keyboard(nonce: str):
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.row(
+        types.InlineKeyboardButton("Подтвердить отправку", callback_data=f"confirm:{nonce}:send"),
+        types.InlineKeyboardButton("Отменить", callback_data=f"confirm:{nonce}:cancel"),
+    )
+    return keyboard

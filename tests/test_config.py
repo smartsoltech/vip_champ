@@ -14,6 +14,7 @@ def test_cli_does_not_require_telegram_token():
     settings = load_settings(require_token=False, environ={})
     assert settings.telegram_api_token == ""
     assert settings.backup_dir.is_absolute()
+    assert settings.startup_timeout_seconds == 600
 
 
 def test_environment_validates_bootstrap_identity_and_normalizes_postgres():
@@ -48,6 +49,12 @@ def test_environment_validates_bootstrap_identity_and_normalizes_postgres():
     {"DATABASE_URL": "sqlite:///"},
     {"BACKUP_DIR": ""},
     {"HEARTBEAT_PATH": ""},
+    {"STARTUP_TIMEOUT_SECONDS": "invalid"},
+    {"STARTUP_TIMEOUT_SECONDS": "59"},
+    {"STARTUP_TIMEOUT_SECONDS": "179", "WATCHDOG_TIMEOUT_SECONDS": "180"},
+    {"STARTUP_TIMEOUT_SECONDS": "0"},
+    {"SHUTDOWN_TIMEOUT_SECONDS": "4"},
+    {"WATCHDOG_TIMEOUT_SECONDS": "90", "HEALTH_MAX_AGE_SECONDS": "90"},
 ])
 def test_invalid_configuration_fails_closed(values):
     with pytest.raises(ConfigurationError):
@@ -57,6 +64,18 @@ def test_invalid_configuration_fails_closed(values):
 def test_missing_runtime_token_is_rejected():
     with pytest.raises(ConfigurationError, match="TELEGRAM_API_TOKEN"):
         load_settings(environ={})
+
+
+def test_startup_budget_can_exceed_or_equal_runtime_budget():
+    settings = load_settings(require_token=False, environ={
+        "STARTUP_TIMEOUT_SECONDS": "900", "WATCHDOG_TIMEOUT_SECONDS": "300",
+        "SHUTDOWN_TIMEOUT_SECONDS": "15",
+    })
+    assert settings.startup_timeout_seconds == 900
+    assert settings.watchdog_timeout_seconds == 300
+    assert settings.shutdown_timeout_seconds == 15
+    equal = load_settings(require_token=False, environ={"STARTUP_TIMEOUT_SECONDS": "180"})
+    assert equal.startup_timeout_seconds == equal.watchdog_timeout_seconds
 
 
 def test_heartbeat_requires_recent_success_from_current_revision(tmp_path):

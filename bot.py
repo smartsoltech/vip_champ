@@ -13,7 +13,12 @@ from types import SimpleNamespace
 
 from telebot import apihelper
 
-from kb import generate_admin_inline_keyboard, generate_contact_keyboard, normalize_telegram_url
+from kb import (
+    generate_admin_inline_keyboard,
+    generate_confirmation_keyboard,
+    generate_contact_keyboard,
+    normalize_telegram_url,
+)
 
 logger = logging.getLogger(__name__)
 MAX_TEXT_LENGTH = 4096
@@ -38,6 +43,7 @@ _CONTENT_TYPES = [
 class Conversation:
     action: str
     expires: float
+    username: str | None = None
 
 
 @dataclass
@@ -51,6 +57,19 @@ class Menu:
 class AuthSession:
     expires: float
     auth_revision: str
+
+
+@dataclass(frozen=True)
+class Confirmation:
+    nonce: str
+    message_id: int
+    expires: float
+    action: str
+    text: str
+    auth_revision: str
+    targets: tuple[int, ...] = ()
+    configured_targets: tuple[int | str, ...] = ()
+    contact_settings: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +92,7 @@ class BotApplication:
         self._states = {}
         self._sessions = {}
         self._menus = {}
+        self._confirmations = {}
         self._attempts = defaultdict(deque)
         self._global_attempts = deque()
         self._lock = threading.RLock()
@@ -85,6 +105,8 @@ class BotApplication:
         self._notified_jobs = deque(maxlen=1024)
         self._next_send_at = 0.0
         self._pending_delivery = None
+        self.last_worker_progress = self.clock()
+        self.worker_healthy = True
         self.bot.message_handler(content_types=_CONTENT_TYPES)(self.handle_message)
         self.bot.callback_query_handler(func=lambda call: True)(self.handle_callback)
 
@@ -133,16 +155,18 @@ class BotApplication:
     def _pop_state(self, key):
         with self._lock:
             self._states.pop(key, None)
+            self._confirmations.pop(key, None)
 
     def _clear(self, key):
         with self._lock:
             self._states.pop(key, None)
             self._menus.pop(key, None)
+            self._confirmations.pop(key, None)
 
     def _cleanup(self):
         with self._lock:
             now = self.clock()
-            for collection in (self._states, self._menus):
+            for collection in (self._states, self._menus, self._confirmations):
                 for key, value in list(collection.items()):
                     if value.expires <= now:
                         collection.pop(key, None)
@@ -159,10 +183,10 @@ class BotApplication:
             while self._global_attempts and self._global_attempts[0] <= oldest:
                 self._global_attempts.popleft()
 
-    def _set_state(self, message, action):
+    def _set_state(self, message, action, *, username=None):
         with self._lock:
             self._states[self._key(message)] = Conversation(
-                action, self.clock() + self.settings.state_ttl_seconds
+                action, self.clock() + self.settings.state_ttl_seconds, username
             )
 
     def _admin(self, message, *, superadmin=False):
@@ -233,23 +257,39 @@ class BotApplication:
             if command == "admin":
                 command = "settings"
         if not self._private(message):
-            if command in _ACTIONS | {"settings", "get_settings", "broadcast_status", "cancel"}:
+            if command in _ACTIONS | {"settings", "get_settings", "broadcast_status", "broadcast_cancel", "cancel", "stop"}:
                 self._safe_notice(message.chat.id, "Управление доступно только в личном чате с ботом.")
             return
         key = self._key(message)
+        with self._lock:
+            state = self._states.get(key)
+        if state and state.action == "login_password" and command not in {"start", "help", "cancel", "stop", "settings"}:
+            self._login(message, username=state.username)
+            return
+        if command == "stop":
+            self._clear(key)
+            self.repository.set_client_subscription(message.chat.id, False)
+            self._send(message.chat.id, "Вы отписаны от рассылок. Уже начатая отправка может завершиться. /start — подписаться снова.")
+            return
         if command in {"start", "help", "cancel"}:
             self._clear(key)
             if command == "cancel":
-                self._send(message.chat.id, "Действие отменено.")
+                self._send(message.chat.id, "Ввод и неподтверждённая отправка отменены. Для остановки рассылки в очереди: /broadcast_cancel НОМЕР.")
+                with self._lock:
+                    authenticated = key in self._sessions
+                if authenticated:
+                    self._show_menu(message)
             else:
-                self.repository.get_or_create_client(
-                    chat_id=message.chat.id, first_name=message.from_user.first_name,
-                    last_name=message.from_user.last_name, is_bot=False,
-                )
+                if command == "start":
+                    self.repository.get_or_create_client(
+                        chat_id=message.chat.id, first_name=message.from_user.first_name,
+                        last_name=message.from_user.last_name, is_bot=False, subscribed=True,
+                    )
                 markup = generate_contact_keyboard(self.repository.get_settings())
+                heading = "Выберите опцию:" if markup else "Контакты пока не настроены. Попробуйте позже."
                 self._send(
                     message.chat.id,
-                    "Выберите опцию:" if markup else "Контакты пока не настроены. Попробуйте позже.",
+                    heading + "\n/stop — отписаться от рассылок. /admin — управление.",
                     reply_markup=markup,
                 )
             return
@@ -258,11 +298,15 @@ class BotApplication:
             with self._lock:
                 self._sessions.pop(key, None)
             self._set_state(message, "login")
-            self._send(message.chat.id, "Введите логин и пароль через пробел. Отмена: /cancel.")
+            self._send(message.chat.id, "Введите логин и пароль через пробел или только логин, чтобы ввести пароль отдельным сообщением. Отмена: /cancel.")
             return
         if command == "broadcast_status":
             self._pop_state(key)
             self._broadcast_status(message)
+            return
+        if command == "broadcast_cancel":
+            self._pop_state(key)
+            self._broadcast_cancel(message)
             return
         if command in _ACTIONS:
             self._pop_state(key)
@@ -273,8 +317,11 @@ class BotApplication:
             return
         with self._lock:
             state = self._states.get(key)
+            confirmation = self._confirmations.get(key)
         if state:
             self._process_state(message, state)
+        elif confirmation:
+            self._send(message.chat.id, "Проверьте предпросмотр и нажмите «Подтвердить отправку» или /cancel.")
         elif text is not None:
             self._send(message.chat.id, "Откройте /start для контактов или /settings для управления.")
 
@@ -291,9 +338,15 @@ class BotApplication:
                     return
                 user = call.from_user
                 key = (message.chat.id, user.id)
+                parts = str(getattr(call, "data", "")).split(":", 2)
+                context = SimpleNamespace(
+                    chat=message.chat, from_user=user, message_id=message.message_id, text=None
+                )
+                if len(parts) == 3 and parts[0] == "confirm":
+                    notice = self._confirm(context, parts[1], parts[2])
+                    return
                 with self._lock:
                     menu = self._menus.get(key)
-                parts = str(getattr(call, "data", "")).split(":", 2)
                 if (
                     menu is None or len(parts) != 3 or parts[0] != "admin"
                     or not secrets.compare_digest(parts[1], menu.nonce)
@@ -302,9 +355,6 @@ class BotApplication:
                 ):
                     notice = "Это меню устарело. Откройте /settings."
                     return
-                context = SimpleNamespace(
-                    chat=message.chat, from_user=user, message_id=message.message_id, text=None
-                )
                 self._pop_state(key)
                 self._begin_action(context, parts[2])
             except Exception as error:  # noqa: BLE001 - callback boundary protects polling.
@@ -349,7 +399,12 @@ class BotApplication:
         if action == "get_settings":
             values = self.repository.get_settings()
             lines = [f"{name}: {value}" for name, value in sorted(values.items())]
-            self._send_chunks(message.chat.id, "\n".join(lines) if lines else "Настройки пока не заданы.")
+            if not lines:
+                lines.append("Настройки пока не заданы.")
+            targets = ", ".join(map(str, self.settings.post_chat_ids)) or "не настроены"
+            lines.append(f"Адресаты публикаций (POST_CHAT_IDS): {targets}")
+            lines.append("Ссылки в кнопках не меняют адресатов публикаций.")
+            self._send_chunks(message.chat.id, "\n".join(lines))
         elif action == "check_admin":
             role = "суперадминистратор" if admin.is_superadmin else "администратор"
             self._send(message.chat.id, f"Ваш доступ: {role}.")
@@ -377,31 +432,50 @@ class BotApplication:
         except Exception as error:  # noqa: BLE001 - deletion failure must not expose credentials.
             logger.info("Credential message cleanup failed (%s)", type(error).__name__)
 
-    def _login(self, message):
+    def _login(self, message, *, username=None):
         text = getattr(message, "text", None)
         if not isinstance(text, str):
-            self._send(message.chat.id, "Нужен текст: логин и пароль через пробел. Отмена: /cancel.")
+            self._send(message.chat.id, "Нужно текстовое сообщение. Отмена: /cancel.")
             return
         self._delete_credentials(message)
+        if username is None:
+            parts = text.split(maxsplit=1)
+            if len(parts) == 1:
+                self._set_state(message, "login_password", username=parts[0])
+                self._send(message.chat.id, "Введите пароль отдельным сообщением. Пробелы в начале и конце сохраняются. Отмена: /cancel.")
+                return
+            if len(parts) != 2:
+                self._send(message.chat.id, "Введите логин либо логин и пароль через пробел. Отмена: /cancel.")
+                return
+            username, password = parts
+        else:
+            password = text
         now = self.clock()
         user_id = message.from_user.id
         with self._lock:
             attempts = self._attempts[user_id]
-            limited = (
-                len(attempts) >= self.settings.auth_max_attempts
-                or len(self._global_attempts) >= self.settings.auth_global_max_attempts
-            )
+            limited = len(attempts) >= self.settings.auth_max_attempts
             if not limited:
                 attempts.append(now)
-                self._global_attempts.append(now)
         if limited:
             self._send(message.chat.id, "Слишком много попыток входа. Попробуйте позже.")
             return
-        parts = text.split(maxsplit=1)
-        if len(parts) != 2:
-            self._send(message.chat.id, "Введите логин и пароль через пробел. Отмена: /cancel.")
-            return
-        admin = self.repository.authenticate_admin(parts[0], parts[1], user_id)
+        # Outsiders retain their per-ID limit but cannot consume administrators' quota.
+        bound_admin = self.repository.get_admin_by_telegram_id(user_id)
+        admin = None
+        if bound_admin is not None:
+            with self._lock:
+                limited = len(self._global_attempts) >= self.settings.auth_global_max_attempts
+                if not limited:
+                    self._global_attempts.append(now)
+            if limited:
+                self._send(message.chat.id, "Слишком много попыток входа. Попробуйте позже.")
+                return
+            admin = self.repository.authenticate_admin(username, password, user_id)
+            # Try the exact secret first: existing passwords may legitimately end in CR/LF.
+            copied_password = password.rstrip("\r\n")
+            if admin is None and copied_password != password:
+                admin = self.repository.authenticate_admin(username, copied_password, user_id)
         if admin is None:
             self._send(message.chat.id, "Неверные данные или аккаунт не разрешён для вашего Telegram ID.")
             return
@@ -412,8 +486,8 @@ class BotApplication:
         self._show_menu(message, admin)
 
     def _process_state(self, message, state):
-        if state.action == "login":
-            self._login(message)
+        if state.action in {"login", "login_password"}:
+            self._login(message, username=state.username)
             return
         admin = self._admin(message, superadmin=state.action in _SUPERADMIN_ACTIONS)
         if admin is None:
@@ -475,17 +549,8 @@ class BotApplication:
             if len(text) > MAX_TEXT_LENGTH:
                 self._send(message.chat.id, "Текст слишком длинный: максимум 4096 символов.")
                 return
-            if state.action == "send_all":
-                job_id = self.repository.create_broadcast(
-                    message.from_user.id, text, expected_auth_revision=admin.auth_revision
-                )
-                self._wake.set()
-                self._send(
-                    message.chat.id,
-                    f"Рассылка №{job_id} поставлена в очередь. Статус: /broadcast_status {job_id}",
-                )
-            else:
-                self._post(message, text)
+            self._preview(message, state.action, text, admin)
+            return
         self._pop_state(self._key(message))
         self._show_menu(message)
 
@@ -520,16 +585,133 @@ class BotApplication:
         )
         self._show_menu(message)
 
-    def _post(self, message, text):
-        markup = generate_contact_keyboard(self.repository.get_settings())
+    def _validate_post_targets(self, configured_targets):
+        if not configured_targets:
+            raise ValueError("Адресаты публикаций не настроены (POST_CHAT_IDS).")
+        try:
+            bot_id = self.bot.get_me().id
+        except Exception:
+            raise ValueError("Не удалось проверить доступ бота. Попробуйте позже.") from None
+        targets = []
+        labels = []
+        for configured in configured_targets:
+            try:
+                chat = self.bot.get_chat(configured)
+                member = self.bot.get_chat_member(chat.id, bot_id)
+            except Exception:
+                raise ValueError(f"Адресат {configured} недоступен для проверки. Проверьте POST_CHAT_IDS и права бота.") from None
+            status = getattr(member, "status", None)
+            allowed = status == "creator"
+            if chat.type == "channel":
+                allowed = allowed or (status == "administrator" and getattr(member, "can_post_messages", False) is True)
+            elif chat.type in {"group", "supergroup"}:
+                permissions = getattr(chat, "permissions", None)
+                allowed = allowed or status == "administrator" or (
+                    status == "member" and getattr(permissions, "can_send_messages", False) is True
+                ) or (
+                    status == "restricted" and getattr(member, "is_member", False) is True
+                    and getattr(member, "can_send_messages", False) is True
+                )
+            else:
+                allowed = False
+            if not allowed:
+                raise ValueError(f"Бот не имеет подтверждённого права публиковать в {configured}. Проверьте права и POST_CHAT_IDS.")
+            if chat.id not in targets:
+                targets.append(chat.id)
+                labels.append(f"{configured} → {chat.id}")
+        return tuple(targets), labels
+
+    def _preview(self, message, action, text, admin):
+        targets = ()
+        configured_targets = ()
+        contacts = None
+        if action == "post_channel":
+            configured_targets = tuple(dict.fromkeys(self.settings.post_chat_ids))
+            try:
+                targets, labels = self._validate_post_targets(configured_targets)
+            except ValueError as error:
+                self._send_chunks(message.chat.id, str(error))
+                return
+            contacts = dict(self.repository.get_settings())
+            heading = "Предпросмотр публикации. Адресаты:\n" + "\n".join(labels)
+            preview_text = text
+        else:
+            heading = "Предпросмотр рассылки. Получатели: все подписанные клиенты на момент подтверждения. Пример сообщения:"
+            preview_text = self._personalize("Имя", text)
+        admin = self._admin(message)
+        if admin is None:
+            return
+        key = self._key(message)
+        self._clear(key)
+        nonce = secrets.token_urlsafe(12)
+        self._send_chunks(message.chat.id, heading)
+        self._send(message.chat.id, preview_text, reply_markup=generate_contact_keyboard(contacts) if contacts is not None else None)
+        sent = self._send(
+            message.chat.id, "Подтвердите отправку. /cancel — отменить этот предпросмотр.",
+            reply_markup=generate_confirmation_keyboard(nonce),
+        )
+        with self._lock:
+            session = self._sessions.get(key)
+            self._confirmations[key] = Confirmation(
+                nonce=nonce, message_id=sent.message_id,
+                expires=min(self.clock() + self.settings.state_ttl_seconds, session.expires if session else 0),
+                action=action, text=text, auth_revision=admin.auth_revision,
+                targets=targets, configured_targets=configured_targets, contact_settings=contacts,
+            )
+
+    def _confirm(self, message, nonce, decision):
+        key = self._key(message)
+        with self._lock:
+            confirmation = self._confirmations.get(key)
+        if (
+            confirmation is None or decision not in {"send", "cancel"}
+            or not secrets.compare_digest(nonce, confirmation.nonce)
+            or confirmation.message_id != message.message_id
+        ):
+            return "Этот предпросмотр устарел или уже обработан."
+        # Consume before I/O: duplicate clicks and ambiguous transport/commit errors cannot repeat it.
+        with self._lock:
+            self._confirmations.pop(key, None)
+        admin = self._admin(message)
+        if admin is None or not secrets.compare_digest(confirmation.auth_revision, admin.auth_revision):
+            return "Войдите снова и создайте новый предпросмотр."
+        if decision == "cancel":
+            self._show_menu(message, admin)
+            return "Предпросмотр отменён."
+        if confirmation.action == "send_all":
+            job_id = self.repository.create_broadcast(
+                message.from_user.id, confirmation.text, expected_auth_revision=admin.auth_revision,
+            )
+            self._wake.set()
+            self._send(
+                message.chat.id,
+                f"Рассылка №{job_id} поставлена в очередь.\nСтатус: /broadcast_status {job_id}\nОстановить: /broadcast_cancel {job_id}",
+            )
+        else:
+            try:
+                configured = tuple(dict.fromkeys(self.settings.post_chat_ids))
+                if configured != confirmation.configured_targets:
+                    raise ValueError("Адресаты публикации изменились. Создайте новый предпросмотр.")
+                targets, _ = self._validate_post_targets(configured)
+                if targets != confirmation.targets:
+                    raise ValueError("Адресаты публикации изменились. Создайте новый предпросмотр.")
+            except ValueError as error:
+                self._send_chunks(message.chat.id, str(error))
+                return "Публикация отменена. Создайте новый предпросмотр."
+            self._post(message, confirmation.text, targets=targets, contact_settings=confirmation.contact_settings)
+        self._show_menu(message)
+        return None
+
+    def _post(self, message, text, *, targets, contact_settings):
+        markup = generate_contact_keyboard(contact_settings)
         results = []
-        for chat_id in dict.fromkeys(self.settings.post_chat_ids):
+        for chat_id in targets:
             if self._admin(message) is None:
                 break
             status, _, _ = self._deliver(chat_id, text, reply_markup=markup)
             labels = {"sent": "отправлено", "failed": "не отправлено", "pending": "отклонено: лимит Telegram", "uncertain": "результат неизвестен"}
             results.append(f"{chat_id}: {labels[status]}")
-        self._send(message.chat.id, "Результат публикации:\n" + "\n".join(results))
+        self._send_chunks(message.chat.id, "Результат публикации:\n" + "\n".join(results))
 
     @staticmethod
     def _personalize(first_name, text):
@@ -571,19 +753,48 @@ class BotApplication:
             return
         self._send(message.chat.id, self._status_text(status))
 
+    def _broadcast_cancel(self, message):
+        admin = self._admin(message)
+        if admin is None:
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        number = parts[1].strip() if len(parts) == 2 else ""
+        if not number.isascii() or not number.isdigit():
+            self._send(message.chat.id, "Используйте /broadcast_cancel НОМЕР.")
+            return
+        try:
+            canceled = self.repository.request_cancel_broadcast(
+                int(number), actor_id=message.from_user.id, expected_auth_revision=admin.auth_revision,
+            )
+        except (ValueError, LookupError, PermissionError):
+            self._send(message.chat.id, "Рассылка не найдена или недоступна.")
+            return
+        self._send(
+            message.chat.id,
+            "Рассылка остановлена. Уже отправленные и выполняющиеся отправки отозвать нельзя."
+            if canceled else "Рассылка уже завершена или отменена.",
+        )
+
     @staticmethod
     def _status_text(status):
         return (
             f"Рассылка №{status['id']} ({status['status']}):\n"
             f"Ожидают: {status['pending']}; выполняются: {status['sending']}; "
             f"отправлены: {status['sent']}; ошибки: {status['failed']}; "
-            f"результат неизвестен: {status['uncertain']}."
+            f"результат неизвестен: {status['uncertain']}; отменены: {status.get('canceled', 0)}."
         )
 
     def process_broadcast_once(self):
         """Process at most one durable recipient, including in deterministic offline tests."""
         with self._broadcast_lock:
-            return self._process_broadcast_once()
+            try:
+                result = self._process_broadcast_once()
+            except Exception:
+                self.worker_healthy = False
+                raise
+            self.last_worker_progress = self.clock()
+            self.worker_healthy = True
+            return result
 
     def _process_broadcast_once(self):
         if self._pending_delivery is not None:
@@ -607,6 +818,13 @@ class BotApplication:
                 )
                 self.repository.cancel_broadcast(job["id"])
                 continue
+            if not self.repository.is_client_subscribed(recipient["chat_id"]):
+                self._pending_delivery = PendingDelivery(
+                    job["id"], job["actor_id"], recipient["chat_id"], "canceled", "client_unsubscribed", None,
+                    recipient["attempt"],
+                )
+                self._persist_delivery()
+                return True
             status, error, retry_after = self._deliver(
                 recipient["chat_id"], self._personalize(recipient["first_name"], job["text"])
             )
@@ -652,6 +870,8 @@ class BotApplication:
                 return
             self.repository.recover_broadcasts()
             self._stop.clear()
+            self.last_worker_progress = self.clock()
+            self.worker_healthy = True
             self._worker = threading.Thread(target=self._work, name="broadcast-worker", daemon=True)
             self._worker.start()
 

@@ -21,6 +21,8 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 COPY --chown=10001:10001 *.py /app/
 COPY --chown=10001:10001 scripts/ /app/scripts/
 USER 10001:10001
+RUN python -m pip check \
+    && python -c "import bot, config, db, healthcheck, kb, main, models; import sys; assert sys.version_info[:2] == (3, 13)"
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD ["python", "healthcheck.py"]
 CMD ["python", "main.py"]

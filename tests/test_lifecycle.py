@@ -50,6 +50,7 @@ class FakePollingBot:
 
     def get_updates(self, *args, **kwargs):
         self.telegram_calls += 1
+        self.harness.telegram_update_hook()
         if self.harness.telegram_error:
             raise RuntimeError("synthetic Telegram transport failure")
         return []
@@ -85,10 +86,16 @@ class LifecycleHarness:
         self.worker_started = False
         self.worker_stopped = False
         self.telegram_error = False
+        self.telegram_update_hook = lambda: None
         self.database_failure = None
         self.initialize_error = False
         self.start_worker_error = False
         self.stop_bot_error = False
+        self.initialize_hook = lambda: None
+        self.start_worker_hook = lambda: None
+        self.watchdog_now = 100.0
+        self.watchdog = None
+        self.watchdog_exits = []
         self.poll_hook = lambda bot: self.request_stop()
         self.signals = {signal.SIGINT: object(), signal.SIGTERM: object()}
         self.original_signals = self.signals.copy()
@@ -105,6 +112,7 @@ class LifecycleHarness:
 
             def initialize(self):
                 super().initialize()
+                harness.initialize_hook()
                 if harness.initialize_error:
                     raise RuntimeError("synthetic migration failure")
 
@@ -129,6 +137,7 @@ class LifecycleHarness:
             def start():
                 original_start()
                 self.worker_started = app._worker.is_alive()
+                self.start_worker_hook()
                 if self.start_worker_error:
                     raise RuntimeError("synthetic failure after starting worker")
 
@@ -146,11 +155,18 @@ class LifecycleHarness:
             self.signals[signum] = handler
             return previous
 
+        watchdog_type = main.LivenessWatchdog
+
+        def make_watchdog(*args, **kwargs):
+            self.watchdog = watchdog_type(*args, **kwargs, clock=lambda: self.watchdog_now, terminate=self.watchdog_exits.append)
+            return self.watchdog
+
         monkeypatch.setattr("db.Repository", TrackingRepository)
         monkeypatch.setattr("bot.setup_bot_handlers", setup)
         monkeypatch.setattr(main.telebot, "TeleBot", lambda *args, **kwargs: self.transport)
         monkeypatch.setattr(main, "Event", lambda: self.event)
         monkeypatch.setattr(main.signal, "signal", set_signal)
+        monkeypatch.setattr(main, "LivenessWatchdog", make_watchdog)
 
     def request_stop(self):
         self.signals[signal.SIGTERM](signal.SIGTERM, None)
@@ -162,6 +178,8 @@ class LifecycleHarness:
         assert not self.settings.heartbeat_path.exists()
         assert self.repository.close_calls == 1
         assert self.signals == self.original_signals
+        assert self.watchdog is not None
+        assert not self.watchdog._thread.is_alive()
         if worker_expected:
             assert self.worker_started
             assert self.worker_stopped
@@ -296,3 +314,113 @@ def test_heartbeat_cleanup_error_does_not_skip_other_cleanup(lifecycle, monkeypa
     assert lifecycle.signals == lifecycle.original_signals
     assert lifecycle.transport.stop_bot_calls == 1
     assert "heartbeat" in caplog.text.lower()
+
+
+def test_slow_backup_and_recovery_use_startup_budget_then_reset_poll_deadline(lifecycle):
+    observed = []
+
+    def initialize():
+        lifecycle.watchdog_now += 361
+        assert not lifecycle.watchdog.started
+        assert lifecycle.watchdog.failure_reason() is None
+        assert not lifecycle.settings.heartbeat_path.exists()
+        observed.append("migration")
+
+    def worker_started():
+        assert not lifecycle.watchdog.started
+        assert lifecycle.watchdog.failure_reason() is None
+        observed.append("recovery")
+
+    def poll(bot):
+        assert lifecycle.watchdog.started
+        assert lifecycle.watchdog.last_poll == lifecycle.watchdog_now
+        bot.get_updates()
+        assert lifecycle.settings.heartbeat_path.exists()
+        observed.append("poll")
+        lifecycle.request_stop()
+
+    lifecycle.initialize_hook = initialize
+    lifecycle.start_worker_hook = worker_started
+    lifecycle.poll_hook = poll
+    lifecycle.run()
+    assert observed == ["migration", "recovery", "poll"]
+    assert lifecycle.watchdog_exits == []
+    lifecycle.assert_clean_shutdown()
+
+
+def test_signal_during_startup_gets_shutdown_budget_and_does_not_start_bot(lifecycle):
+    def initialize():
+        assert not lifecycle.watchdog.started
+        lifecycle.request_stop()
+        assert lifecycle.watchdog.shutdown_started == lifecycle.watchdog_now
+        lifecycle.watchdog_now += 29
+        assert lifecycle.watchdog.failure_reason() is None
+        lifecycle.watchdog_now += 2
+        assert lifecycle.watchdog.check() == "shutdown_timeout"
+
+    lifecycle.initialize_hook = initialize
+    lifecycle.run()
+    assert lifecycle.watchdog_exits and set(lifecycle.watchdog_exits) == {70}
+    assert lifecycle.application is None
+    assert lifecycle.transport.polls == 0
+    assert lifecycle.transport.stop_bot_calls == 0
+    lifecycle.assert_clean_shutdown(worker_expected=False)
+
+
+def test_signal_during_worker_start_does_not_enter_polling(lifecycle):
+    lifecycle.start_worker_hook = lifecycle.request_stop
+    lifecycle.run()
+    assert lifecycle.transport.polls == 0
+    assert not lifecycle.watchdog.started
+    assert lifecycle.watchdog.shutdown_started is not None
+    lifecycle.assert_clean_shutdown()
+
+
+def test_stalled_worker_cannot_refresh_heartbeat_even_when_poll_and_database_succeed(lifecycle):
+    def poll(bot):
+        bot.get_updates()
+        before = lifecycle.settings.heartbeat_path.read_bytes()
+        application = lifecycle.application
+        # Block the real worker independently from polling/readiness checks.
+        with application._broadcast_lock:
+            application.last_worker_progress = lifecycle.watchdog_now
+            lifecycle.watchdog_now += lifecycle.settings.watchdog_timeout_seconds + 1
+            bot.get_updates()
+            assert lifecycle.settings.heartbeat_path.read_bytes() == before
+            assert lifecycle.watchdog.check() == "broadcast_worker_stalled"
+        lifecycle.request_stop()
+
+    lifecycle.poll_hook = poll
+    lifecycle.run()
+    assert lifecycle.watchdog_exits and set(lifecycle.watchdog_exits) == {70}
+    lifecycle.assert_clean_shutdown()
+
+
+def test_unhealthy_worker_does_not_refresh_readiness_heartbeat(lifecycle):
+    def poll(bot):
+        bot.get_updates()
+        before = lifecycle.settings.heartbeat_path.read_bytes()
+        with lifecycle.application._broadcast_lock:
+            lifecycle.application.worker_healthy = False
+            bot.get_updates()
+            assert lifecycle.settings.heartbeat_path.read_bytes() == before
+        lifecycle.request_stop()
+
+    lifecycle.poll_hook = poll
+    lifecycle.run()
+    lifecycle.assert_clean_shutdown()
+
+
+def test_late_poll_response_after_signal_does_not_probe_db_or_refresh_heartbeat(lifecycle):
+    def poll(bot):
+        bot.get_updates()
+        before = lifecycle.settings.heartbeat_path.read_bytes()
+        ping_count = lifecycle.repository.ping_calls
+        lifecycle.telegram_update_hook = lifecycle.request_stop
+        assert bot.get_updates() == []
+        assert lifecycle.repository.ping_calls == ping_count
+        assert lifecycle.settings.heartbeat_path.read_bytes() == before
+
+    lifecycle.poll_hook = poll
+    lifecycle.run()
+    lifecycle.assert_clean_shutdown()

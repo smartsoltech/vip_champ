@@ -9,6 +9,7 @@ import telebot
 
 from config import ConfigurationError, Settings, load_settings
 from healthcheck import write_heartbeat
+from watchdog import LivenessWatchdog
 
 
 class RedactingFormatter(logging.Formatter):
@@ -45,20 +46,40 @@ def run(settings: Settings) -> None:
     bot = None
     application = None
     previous_handlers = {}
+    watchdog = LivenessWatchdog(
+        settings.watchdog_timeout_seconds, settings.shutdown_timeout_seconds,
+        lambda: application, startup_timeout=settings.startup_timeout_seconds,
+    )
+
+    def stop(signum, frame):
+        watchdog.begin_shutdown()
+        stopped.set()
+        if bot is not None:
+            bot.stop_polling()
+
     try:
+        watchdog.start()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[sig] = signal.signal(sig, stop)
         repository.acquire_runtime_lock()
         repository.initialize()
+        if stopped.is_set():
+            return
         if settings.masteradmin_login:
             repository.ensure_bootstrap_admin(
                 settings.masteradmin_login,
                 settings.masteradmin_password,
                 next(iter(settings.masteradmin_telegram_ids)),
             )
+        if stopped.is_set():
+            return
         bot = telebot.TeleBot(settings.telegram_api_token, threaded=True, num_threads=4)
         original_get_updates = bot.get_updates
 
         def healthy_get_updates(*args, **kwargs):
             updates = original_get_updates(*args, **kwargs)
+            if stopped.is_set():
+                return []
             try:
                 if not repository.ping():
                     raise RuntimeError("Database readiness query failed")
@@ -68,19 +89,19 @@ def run(settings: Settings) -> None:
                 stopped.set()
                 bot.stop_polling()
                 raise
-            write_heartbeat(settings.heartbeat_path, settings.revision)
+            watchdog.poll_succeeded()
+            if not stopped.is_set() and application is not None and application.worker_healthy and watchdog.failure_reason() is None:
+                write_heartbeat(settings.heartbeat_path, settings.revision)
             return updates
 
         bot.get_updates = healthy_get_updates
         application = setup_bot_handlers(bot, repository, settings)
-
-        def stop(signum, frame):
-            stopped.set()
-            bot.stop_polling()
-
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            previous_handlers[sig] = signal.signal(sig, stop)
+        if stopped.is_set():
+            return
         application.start()
+        if stopped.is_set():
+            return
+        watchdog.mark_started()
         logger.info("Starting bot revision=%s", settings.revision)
         while not stopped.is_set():
             try:
@@ -95,6 +116,7 @@ def run(settings: Settings) -> None:
             if not stopped.is_set():
                 stopped.wait(5)
     finally:
+        watchdog.begin_shutdown()
         try:
             settings.heartbeat_path.unlink(missing_ok=True)
         except OSError:
@@ -112,7 +134,10 @@ def run(settings: Settings) -> None:
                 if application is not None:
                     application.stop()
             finally:
-                repository.close()
+                try:
+                    repository.close()
+                finally:
+                    watchdog.stop()
 
 
 def main() -> int:

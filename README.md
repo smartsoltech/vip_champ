@@ -4,16 +4,15 @@ Python 3.13, pyTelegramBotAPI, SQLAlchemy and PostgreSQL. SQLite remains availab
 for isolated tests and migration of the legacy database. Importing application
 modules does not start the bot or modify a database.
 
-Current rollout status (2026-10-20): the new PVE LXC **138** (`vip-champ`,
-`192.168.50.250`) and `/opt/vip_champ` target are prepared. The dedicated
-`vip_champ` database and restricted application role exist on PostgreSQL 16.15
-at `192.168.20.2`; its fresh schema and owner account bound to `556399210` have
-been initialized and backed up. Drone is enabled with the five
-deployment secrets below. The latest instruction is a fresh start: the old bot is
-not running, and no legacy database or settings are to be imported.
-A valid rotated bot token is still required;
-real polling has not been completed. See
-[the audit/remediation report](docs/AUDIT_REMEDIATION.md).
+The production bot is **@VIPchatadmin_bot**, hosted in PVE LXC **138**
+(`vip-champ`, `192.168.50.250`) under `/opt/vip_champ`. Its dedicated PostgreSQL
+database and restricted application role are on `192.168.20.2`. The owner account
+is bound to Telegram ID `556399210`. This installation started with a fresh
+database; no legacy production data was imported. `backup` (Gitea) is the primary
+remote, `origin` (GitHub) is the mirror; the main branch is `master`.
+See [the audit/remediation report](docs/AUDIT_REMEDIATION.md) and
+[operations runbook](docs/OPERATIONS.md). CI and runtime checks are separate:
+a green test job alone does not establish successful deployment or delivery.
 
 ## Configuration and local checks
 
@@ -72,7 +71,12 @@ Administrative operations are accepted only in private chats and are bound to
 the sender's numeric Telegram user ID. `/admin` (or `/settings`) starts password
 login; both commands use the same authentication and are private-chat only.
 Admin menu buttons are bound to the authenticated sender and message and expire.
-`/start` and `/cancel` discard the current input flow.
+Enter `login password`, or enter the login and password in separate messages.
+Passwords retain meaningful spaces; a pasted trailing line ending is tolerated
+only after trying the exact password. Unknown Telegram IDs cannot exhaust a
+bound administrator's global login quota.
+`/cancel` discards the input flow and returns the admin menu; it does not cancel
+already queued messages. `/start` subscribes the client, `/stop` unsubscribes.
 
 Superadmins use `/add_admin` or `/add_superadmin`, followed by
 `TELEGRAM_ID login password`; passwords may contain spaces.
@@ -86,11 +90,17 @@ The CLI prompts for a password without echo. `python admin.py --help` describes
 identity rebinding and password reset; credentials are not accepted as command
 line arguments.
 
-`/send_all` creates a persistent broadcast job. `/broadcast_status JOB_ID`
-reports sent/failed/uncertain recipients. An ambiguous network outcome is marked
-uncertain and is not automatically retried, preventing duplicate delivery.
-`/post_channel` can publish only to configured `POST_CHAT_IDS`. CSV import accepts
-UTF-8 files up to 5 MB, and the canonical export format can be imported again.
+`/send_all` previews a text broadcast and queues it only after explicit,
+single-use confirmation. `/broadcast_status JOB_ID` reports delivery counters;
+`/broadcast_cancel JOB_ID` cancels remaining recipients for the job's creator or
+a superadmin. An in-flight message may already have been sent when cancellation
+arrives. An ambiguous network outcome is marked uncertain and is not
+automatically retried. This avoids blindly duplicating messages, but cannot
+guarantee exactly-once delivery across Telegram and database failures.
+`/post_channel` also requires confirmation and checks the bot's permissions for
+the explicit `POST_CHAT_IDS` allowlist. Contact links do not grant permission to
+publish there. CSV import accepts UTF-8 files up to 5 MB; export/import preserves
+opt-out state and never silently re-subscribes existing clients.
 
 ## Database, backups and migration
 
@@ -110,8 +120,16 @@ image includes PostgreSQL client 16 from the PostgreSQL signed APT repository,
 matching the production server's major version for restore compatibility.
 `BACKUP_DIR` defaults to `db/backups`; Compose fixes it to `/app/db/backups`.
 PostgreSQL credentials are passed to `pg_dump` through environment variables,
-not its command line. Backup retention and an independent/off-host copy remain
-operator responsibilities.
+not its command line. Backups are written to temporary files, validated using
+`pg_restore --list` or SQLite `quick_check`, and atomically renamed on success.
+Failed or timed-out backups are not published as completed archives.
+Schema v2 adds subscription state through an incremental, backed-up migration.
+PostgreSQL connections default to a 10-second connect timeout, 30-second
+statement timeout, 5-second lock timeout, and TCP keepalives; explicit URL
+parameters override these defaults. Native backups preserve TLS parameters.
+The PVE backup timer and off-host retention are described in
+[OPERATIONS.md](docs/OPERATIONS.md); `scripts/pve_backup.py` runs on the PVE host,
+not inside the application container.
 
 Use `python scripts/migrate_sqlite_to_postgres.py --help` for the checked legacy
 SQLite import when migrating another installation. This deployment starts fresh
@@ -134,11 +152,15 @@ limited memory/CPU/processes and a temporary `/tmp`. Prepare the host `db` and
 Only `/app/db` is persistent; it holds heartbeat and backup files, not the
 PostgreSQL server's data directory. PostgreSQL is an external service.
 
-Health becomes successful only after a completed Telegram `getUpdates` request
-and a successful database query. Heartbeats include PID, timestamp and release
+Health becomes successful only after a completed Telegram `getUpdates` request,
+a successful database query and a healthy broadcast worker. Heartbeats include PID, timestamp and release
 revision. Stale heartbeats, wrong revisions and dead processes fail the check.
-A live Python process alone is insufficient. SIGTERM stops polling and workers
-and closes database connections. Logs redact configured secrets and bot tokens.
+A live Python process alone is insufficient. A separate watchdog thread exits a
+stalled process so Docker's restart policy can recover it. Normal polling or
+worker progress must resume within `WATCHDOG_TIMEOUT_SECONDS` (180 by default).
+Startup has `STARTUP_TIMEOUT_SECONDS` (600) for backup/migration; graceful
+shutdown has `SHUTDOWN_TIMEOUT_SECONDS` (30). Logs redact configured secrets and
+bot tokens.
 
 ## Drone deployment
 
@@ -158,33 +180,38 @@ Configure these repository-scoped Drone secrets on the approved runner:
 | `vip_champ_deploy_known_hosts` | Independently verified SSH host key entry |
 | `vip_champ_deploy_path` | Absolute application directory on that host |
 | `vip_champ_telegram_api_token` | Live bot token; available only to the deploy step, never pull requests |
+| `vip_champ_registry_config` | Docker auth JSON for Gitea registry; dedicated `write:package` token, no pull-request access |
 
 The host must have Docker Engine, the Compose plugin, Python 3, Bash, tar, `flock`, and
 `sha256sum`. The approved application target is LXC 138 (`192.168.50.250`),
 Debian 13, 2 vCPU, 2 GiB RAM, 24 GiB disk, with Docker 26 and deployment directory
-`/opt/vip_champ`. No existing application container is replaced.
+`/opt/vip_champ`.
 Before first deployment
 create `DEPLOY_PATH/shared/.env` with mode `0600` and prepare
 `DEPLOY_PATH/shared/db/backups` for UID/GID `10001:10001`.
 Set the bot token in Drone repository Settings → Secrets as
-`vip_champ_telegram_api_token`. The initial value `CHANGE_ME_IN_DRONE_SETTINGS`
-is a placeholder and deliberately prevents deployment. After replacing it,
-restart the latest push pipeline; later pushes to `master` deploy automatically.
+`vip_champ_telegram_api_token`. Empty or placeholder credentials prevent
+deployment. Pushes to `master` deploy automatically after successful checks.
 The token travels over SSH standard input, never in command-line arguments,
 Git files or image build arguments. Under the deployment lock, a helper validates
-it and atomically updates only `TELEGRAM_API_TOKEN` in the external `.env`,
-preserving the PostgreSQL connection and other settings with file mode `0600`.
+it in a private candidate `.env` and verifies Telegram `getMe` before replacing
+the running service. After successful readiness checks, it atomically promotes
+the candidate, preserving the PostgreSQL connection and other settings with
+file mode `0600`. A failed candidate retains/restores the previous environment.
 The external `.env` is the runtime copy; manage the token's source value in Drone.
-The shared PostgreSQL server currently has SSL disabled. This existing server
-setting has not been changed; the application's database connection is therefore
-not protected by PostgreSQL TLS. Enabling TLS requires a separate coordinated
-change to that shared service.
+Production PostgreSQL supports TLS. The application uses `sslmode=verify-full`
+with the pinned server certificate at `/app/db/certs/pg-ca.crt`, carried in the
+persistent data volume. The certificate includes the server IP in its SAN.
+Certificate rotation must update the trusted public certificate before expiry.
 
-Deployment transfers an archive of the exact verified Git commit, verifies its
-SHA-256, builds an image labelled with that revision and creates a database backup
-before application initialization. It keeps prior release directories and
-images, starts the replacement and waits for actual polling/database health.
-Only then does it advance the `current` symlink.
+The approved Docker plugin builds and publishes the full-commit-tagged image to
+`git.smartsoltech.kr/trevor/vip-champ`. An unprivileged export step pins its
+registry digest, validates the image revision, and exports a Docker archive.
+Deployment transfers both the source and image archives with SHA-256 checks,
+loads the exact CI image ID, and creates a database backup before initialization.
+There is no application-host rebuild. Prior releases remain available for
+rollback. Only after actual polling/database/worker health and exact revision
+and image-ID checks does it advance `current`.
 
 If the health gate fails, the previous application image is restarted when
 available. The database is **not automatically restored**, since that could

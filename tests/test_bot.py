@@ -49,6 +49,12 @@ class FakeBot:
         self.failure = {}
         self.download = b""
         self.counter = 0
+        self.chats = {
+            "@audit_channel": SimpleNamespace(id=-10077777, type="channel"),
+            -10012345: SimpleNamespace(id=-10012345, type="supergroup", permissions=SimpleNamespace(can_send_messages=True)),
+        }
+        self.members = {}
+        self.permission_checks = []
 
     def message_handler(self, **kwargs):
         return lambda callback: callback
@@ -86,6 +92,19 @@ class FakeBot:
 
     def download_file(self, file_path):
         return self.download
+
+    def get_me(self):
+        return SimpleNamespace(id=999, username="audit_bot")
+
+    def get_chat(self, chat_id):
+        return self.chats[chat_id]
+
+    def get_chat_member(self, chat_id, user_id):
+        self.permission_checks.append((chat_id, user_id))
+        member = self.members.get(chat_id, SimpleNamespace(status="administrator", can_post_messages=True))
+        if isinstance(member, Exception):
+            raise member
+        return member
 
 
 def telegram_error(code, retry_after=None):
@@ -139,6 +158,17 @@ class BotBehaviorTests(unittest.TestCase):
 
     def client(self, chat_id=CLIENT):
         self.repo.get_or_create_client(chat_id, "Demo", "Client", False)
+
+    def confirm(self, *, user=OWNER, decision="send", menu=None):
+        menu = menu or self.menu(user)
+        buttons = [button for row in menu.markup.to_dict()["inline_keyboard"] for button in row]
+        data = next(button["callback_data"] for button in buttons if button["callback_data"].endswith(":" + decision))
+        call = SimpleNamespace(
+            id=f"confirmation-{len(self.bot.answers)}", data=data,
+            message=menu, from_user=message(user=user).from_user,
+        )
+        self.app.handle_callback(call)
+        return call
 
     def test_admin_aliases_require_login_and_open_owner_menu_after_valid_credentials(self):
         for command in ("/admin", "/admin@audit_bot"):
@@ -199,8 +229,10 @@ class BotBehaviorTests(unittest.TestCase):
         self.login()
         self.app.handle_message(message("/post_channel"))
         self.app.handle_message(message("authorized post"))
-        destinations = [item.chat.id for item in self.bot.sent if item.text == "authorized post"]
-        self.assertEqual(destinations, list(self.settings.post_chat_ids))
+        self.assertFalse(any(item.chat.id < 0 for item in self.bot.sent))
+        self.confirm()
+        destinations = [item.chat.id for item in self.bot.sent if item.text == "authorized post" and item.chat.id != OWNER]
+        self.assertEqual(destinations, [-10077777, -10012345])
 
     def test_group_authentication_and_commands_cannot_create_or_hijack_state(self):
         with patch.object(self.repo, "authenticate_admin", wraps=self.repo.authenticate_admin) as auth:
@@ -385,6 +417,64 @@ class BotBehaviorTests(unittest.TestCase):
             self.app.handle_message(message("bad wrong password", OWNER))
             self.assertEqual(auth.call_count, 4)
 
+    def test_separate_password_input_preserves_leading_and_trailing_whitespace(self):
+        for password in ("  leading synthetic password", "trailing synthetic password  ", "newline synthetic password\r\n"):
+            with self.subTest(kind=password.split()[0]):
+                self.repo.update_admin("owner", password=password)
+                self.clock.advance(301)
+                self.app.handle_message(message("/admin"))
+                self.app.handle_message(message("owner"))
+                self.assertEqual(self.app._states[(OWNER, OWNER)].action, "login_password")
+                with patch.object(self.repo, "authenticate_admin", wraps=self.repo.authenticate_admin) as auth:
+                    self.app.handle_message(message(password))
+                auth.assert_called_once_with("owner", password, OWNER)
+                self.assertIn((OWNER, OWNER), self.app._sessions)
+
+    def test_copied_line_endings_fall_back_only_after_exact_password_fails(self):
+        for suffix in ("\n", "\r\n"):
+            with self.subTest(suffix=repr(suffix)):
+                self.clock.advance(301)
+                self.app.handle_message(message("/admin"))
+                with patch.object(self.repo, "authenticate_admin", wraps=self.repo.authenticate_admin) as auth:
+                    self.app.handle_message(message(f"owner {PASSWORD}{suffix}"))
+                self.assertEqual(auth.call_args_list[0].args, ("owner", PASSWORD + suffix, OWNER))
+                self.assertEqual(auth.call_args_list[1].args, ("owner", PASSWORD, OWNER))
+                self.assertIn((OWNER, OWNER), self.app._sessions)
+        self.app.handle_message(message("/admin"))
+        self.app.handle_message(message(f"owner {PASSWORD} "))
+        self.assertNotIn((OWNER, OWNER), self.app._sessions)
+
+    def test_unknown_ids_cannot_exhaust_bound_admin_quota_and_are_still_limited(self):
+        with (
+            patch.object(self.repo, "authenticate_admin", wraps=self.repo.authenticate_admin) as auth,
+            patch.object(self.repo, "get_admin_by_telegram_id", wraps=self.repo.get_admin_by_telegram_id) as lookup,
+        ):
+            for user in range(3000, 3010):
+                self.app.handle_message(message("/admin", user))
+                for _ in range(6):
+                    self.app.handle_message(message("owner synthetic wrong password", user))
+            self.assertEqual(lookup.call_count, 50)
+            auth.assert_not_called()
+            self.assertEqual(len(self.app._global_attempts), 0)
+            self.login()
+            auth.assert_called_once_with("owner", PASSWORD, OWNER)
+        self.assertIn((OWNER, OWNER), self.app._sessions)
+
+    def test_separate_password_is_private_expires_and_keeps_generic_denial(self):
+        self.app.handle_message(message("/admin", CLIENT))
+        self.app.handle_message(message("owner", CLIENT))
+        self.app.handle_message(message(PASSWORD, CLIENT))
+        outsider_denial = self.bot.sent[-1].text
+        self.app.handle_message(message("/admin"))
+        self.app.handle_message(message("owner"))
+        self.app.handle_message(message("synthetic incorrect password"))
+        self.assertEqual(self.bot.sent[-1].text, outsider_denial)
+        self.clock.advance(self.settings.state_ttl_seconds + 1)
+        with patch.object(self.repo, "authenticate_admin", wraps=self.repo.authenticate_admin) as auth:
+            self.app.handle_message(message(PASSWORD))
+            auth.assert_not_called()
+        self.assertNotIn((OWNER, OWNER), self.app._sessions)
+
     def test_credentials_and_internal_exception_details_are_never_sent_or_logged(self):
         self.app.handle_message(message("/settings"))
         secret = "synthetic-password-for-log-check"
@@ -445,6 +535,8 @@ class BotBehaviorTests(unittest.TestCase):
         self.login()
         self.app.handle_message(message("/send_all"))
         self.app.handle_message(message("X" * 4096))
+        self.assertEqual(self.repo.pending_broadcasts(), [])
+        self.confirm()
         jobs = self.repo.pending_broadcasts()
         self.assertEqual(len(jobs), 1)
         self.assertTrue(self.app.process_broadcast_once())
@@ -526,6 +618,134 @@ class BotBehaviorTests(unittest.TestCase):
         self.assertEqual(self.repo.get_broadcast_status(job_id)["status"], "canceled")
         self.assertFalse(any(item.chat.id == CLIENT for item in self.bot.sent))
 
+    def test_broadcast_preview_requires_owner_confirmation_and_is_consumed_once(self):
+        self.client()
+        self.login()
+        self.app.handle_message(message("/send_all"))
+        self.app.handle_message(message("confirmed broadcast"))
+        preview = self.menu()
+        self.assertEqual(self.repo.pending_broadcasts(), [])
+        self.confirm(user=CLIENT, menu=preview)
+        self.assertEqual(self.repo.pending_broadcasts(), [])
+        call = self.confirm(menu=preview)
+        self.app.handle_callback(call)
+        self.assertEqual(len(self.repo.pending_broadcasts()), 1)
+        self.assertEqual(len(self.bot.answers), 3)
+        self.assertFalse(any(item.chat.id == CLIENT for item in self.bot.sent))
+
+    def test_parallel_confirmation_clicks_create_only_one_broadcast(self):
+        self.client()
+        self.login()
+        self.app.handle_message(message("/send_all"))
+        self.app.handle_message(message("send exactly once"))
+        preview = self.menu()
+        barrier = threading.Barrier(2)
+
+        def click():
+            barrier.wait(timeout=5)
+            self.confirm(menu=preview)
+
+        threads = [threading.Thread(target=click) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(len(self.repo.pending_broadcasts()), 1)
+
+    def test_expired_replaced_and_canceled_previews_cannot_enqueue(self):
+        self.client()
+        self.login()
+        for invalidate in ("expire", "/cancel", "/start", "/get_settings"):
+            with self.subTest(invalidate=invalidate):
+                self.app.handle_message(message("/send_all"))
+                self.app.handle_message(message("discarded preview"))
+                preview = self.menu()
+                if invalidate == "expire":
+                    self.clock.advance(self.settings.state_ttl_seconds + 1)
+                else:
+                    self.app.handle_message(message(invalidate))
+                self.confirm(menu=preview)
+                self.assertEqual(self.repo.pending_broadcasts(), [])
+
+    def test_password_reset_between_preview_and_confirmation_revokes_send(self):
+        self.client()
+        self.login(OPERATOR, "operator")
+        self.app.handle_message(message("/send_all", OPERATOR))
+        self.app.handle_message(message("must never be sent", OPERATOR))
+        preview = self.menu(OPERATOR)
+        self.repo.update_admin("operator", password="replacement synthetic password")
+        self.confirm(user=OPERATOR, menu=preview)
+        self.assertEqual(self.repo.pending_broadcasts(), [])
+        self.assertNotIn((OPERATOR, OPERATOR), self.app._sessions)
+
+    def test_cancel_distinguishes_input_from_queue_and_enforces_job_ownership(self):
+        self.client()
+        owner_job = self.repo.create_broadcast(OWNER, "owned by superadmin")
+        operator_job = self.repo.create_broadcast(OPERATOR, "owned by operator")
+        self.login(OPERATOR, "operator")
+        self.app.handle_message(message("/cancel", OPERATOR))
+        self.assertTrue(any("/broadcast_cancel" in item.text for item in self.bot.sent[-2:]))
+        self.assertIsNotNone(self.bot.sent[-1].markup)
+        self.assertEqual(self.repo.get_broadcast_status(operator_job)["status"], "pending")
+        self.app.handle_message(message(f"/broadcast_cancel {owner_job}", OPERATOR))
+        self.assertEqual(self.repo.get_broadcast_status(owner_job)["status"], "pending")
+        self.app.handle_message(message(f"/broadcast_cancel {operator_job}", OPERATOR))
+        self.assertEqual(self.repo.get_broadcast_status(operator_job)["status"], "canceled")
+        self.login()
+        self.app.handle_message(message(f"/broadcast_cancel {owner_job}"))
+        self.assertEqual(self.repo.get_broadcast_status(owner_job)["status"], "canceled")
+        self.assertFalse(self.app.process_broadcast_once())
+        self.assertFalse(any(item.chat.id == CLIENT for item in self.bot.sent))
+
+    def test_stop_opts_out_queued_broadcast_and_start_resubscribes(self):
+        self.app.handle_message(message("/start", CLIENT))
+        job_id = self.repo.create_broadcast(OWNER, "before opt out")
+        self.app.handle_message(message("/stop", CLIENT))
+        self.assertFalse(self.repo.is_client_subscribed(CLIENT))
+        self.assertEqual(self.repo.get_broadcast_status(job_id)["canceled"], 1)
+        self.assertFalse(self.app.process_broadcast_once())
+        self.app.handle_message(message("/help", CLIENT))
+        self.assertFalse(self.repo.is_client_subscribed(CLIENT))
+        self.app.handle_message(message("/start", CLIENT))
+        self.assertTrue(self.repo.is_client_subscribed(CLIENT))
+        next_job = self.repo.create_broadcast(OWNER, "after subscription")
+        self.assertTrue(self.app.process_broadcast_once())
+        self.assertEqual(self.repo.get_broadcast_status(next_job)["sent"], 1)
+        self.assertFalse(any("before opt out" in item.text for item in self.bot.sent))
+
+    def test_optout_after_claim_is_checked_again_before_delivery(self):
+        self.client()
+        job_id = self.repo.create_broadcast(OWNER, "do not send after optout")
+        claim = self.repo.get_broadcast_batch
+
+        def claim_then_opt_out(*args, **kwargs):
+            rows = claim(*args, **kwargs)
+            self.repo.set_client_subscription(CLIENT, False)
+            return rows
+
+        with patch.object(self.repo, "get_broadcast_batch", side_effect=claim_then_opt_out):
+            self.assertTrue(self.app.process_broadcast_once())
+        self.assertEqual(self.repo.get_broadcast_status(job_id)["canceled"], 1)
+        self.assertFalse(any(item.chat.id == CLIENT for item in self.bot.sent))
+
+    def test_worker_progress_does_not_advance_on_failed_persistence_and_recovers(self):
+        self.client()
+        job_id = self.repo.create_broadcast(OWNER, "test worker health")
+        before = self.app.last_worker_progress
+        self.clock.advance(5)
+        with patch.object(self.repo, "record_broadcast_result", side_effect=RuntimeError("synthetic unavailable write")):
+            with self.assertRaises(RuntimeError):
+                self.app.process_broadcast_once()
+        self.assertFalse(self.app.worker_healthy)
+        self.assertEqual(self.app.last_worker_progress, before)
+        self.clock.advance(5)
+        self.assertTrue(self.app.process_broadcast_once())
+        self.assertTrue(self.app.worker_healthy)
+        self.assertEqual(self.app.last_worker_progress, self.clock())
+        self.assertEqual(self.repo.get_broadcast_status(job_id)["sent"], 1)
+        self.assertEqual(sum(item.chat.id == CLIENT for item in self.bot.sent), 1)
+
     def test_simultaneous_users_cannot_overwrite_each_others_settings_conversation(self):
         self.login()
         self.login(OPERATOR, "operator")
@@ -590,8 +810,97 @@ class BotBehaviorTests(unittest.TestCase):
         self.bot.failure[-10012345] = [TimeoutError("unknown outcome")]
         self.app.handle_message(message("/post_channel"))
         self.app.handle_message(message("post once"))
-        self.assertEqual(sum(item.text == "post once" for item in self.bot.sent), 1)
+        self.confirm()
+        self.assertEqual(sum(item.text == "post once" and item.chat.id != OWNER for item in self.bot.sent), 1)
         self.assertTrue(any("результат неизвестен" in item.text for item in self.bot.sent))
+
+    def test_publication_targets_are_explicit_and_independent_of_contact_links(self):
+        self.repo.set_setting("channel_link", "https://t.me/some_other_channel")
+        self.login()
+        self.app.handle_message(message("/get_settings"))
+        settings_text = "\n".join(item.text for item in self.bot.sent)
+        self.assertIn("POST_CHAT_IDS", settings_text)
+        self.assertIn("@audit_channel", settings_text)
+        self.assertIn("-10012345", settings_text)
+        self.app.handle_message(message("/post_channel"))
+        self.app.handle_message(message("explicit targets"))
+        self.assertTrue(any("@audit_channel → -10077777" in item.text for item in self.bot.sent))
+        call = self.confirm()
+        self.app.handle_callback(call)
+        destinations = [item.chat.id for item in self.bot.sent if item.chat.id < 0]
+        self.assertEqual(destinations, [-10077777, -10012345])
+        self.assertEqual(self.bot.permission_checks, [(-10077777, 999), (-10012345, 999)] * 2)
+
+    def test_publication_preflight_fails_closed_for_missing_membership_or_permission(self):
+        self.login()
+        for member in (
+            SimpleNamespace(status="left"),
+            SimpleNamespace(status="administrator", can_post_messages=False),
+            telegram_error(400),
+        ):
+            with self.subTest(member=type(member).__name__):
+                self.bot.members[-10077777] = member
+                self.app.handle_message(message("/post_channel"))
+                self.app.handle_message(message("blocked publication"))
+                self.assertEqual(self.app._confirmations, {})
+                self.assertFalse(any(item.chat.id < 0 for item in self.bot.sent))
+        self.assertTrue(any("Проверьте" in item.text for item in self.bot.sent))
+
+    def test_publication_permission_loss_between_preview_and_confirm_prevents_all_sends(self):
+        self.login()
+        self.app.handle_message(message("/post_channel"))
+        self.app.handle_message(message("permission changed"))
+        preview = self.menu()
+        self.bot.members[-10012345] = SimpleNamespace(status="left")
+        call = self.confirm(menu=preview)
+        self.assertFalse(any(item.chat.id < 0 for item in self.bot.sent))
+        self.bot.members.clear()
+        self.app.handle_callback(call)
+        self.assertFalse(any(item.chat.id < 0 for item in self.bot.sent))
+
+    def test_publication_changed_resolved_target_requires_new_preview(self):
+        self.login()
+        self.app.handle_message(message("/post_channel"))
+        self.app.handle_message(message("target changed"))
+        preview = self.menu()
+        self.bot.chats["@audit_channel"] = SimpleNamespace(id=-10088888, type="channel")
+        self.confirm(menu=preview)
+        self.assertFalse(any(item.chat.id < 0 for item in self.bot.sent))
+        self.assertTrue(any("Адресаты публикации изменились" in item.text for item in self.bot.sent))
+
+    def test_confirmation_lost_commit_response_does_not_create_second_job(self):
+        self.client()
+        self.login()
+        self.app.handle_message(message("/send_all"))
+        self.app.handle_message(message("single confirmed job"))
+        real_create = self.repo.create_broadcast
+
+        def commit_without_response(*args, **kwargs):
+            real_create(*args, **kwargs)
+            raise RuntimeError("synthetic commit acknowledgement lost")
+
+        with (
+            patch.object(self.repo, "create_broadcast", side_effect=commit_without_response) as create,
+            self.assertLogs("bot", level="WARNING"),
+        ):
+            call = self.confirm()
+            self.app.handle_callback(call)
+            self.assertEqual(create.call_count, 1)
+        self.assertEqual(len(self.repo.pending_broadcasts()), 1)
+
+    def test_broadcast_cancel_rechecks_revision_inside_repository(self):
+        self.client()
+        job_id = self.repo.create_broadcast(OPERATOR, "keep job until authorized cancellation")
+        self.login(OPERATOR, "operator")
+        real_cancel = self.repo.request_cancel_broadcast
+
+        def revoke_during_cancel(*args, **kwargs):
+            self.repo.update_admin("operator", password="replacement cancellation password")
+            return real_cancel(*args, **kwargs)
+
+        with patch.object(self.repo, "request_cancel_broadcast", side_effect=revoke_during_cancel):
+            self.app.handle_message(message(f"/broadcast_cancel {job_id}", OPERATOR))
+        self.assertEqual(self.repo.get_broadcast_status(job_id)["status"], "pending")
 
 
 if __name__ == "__main__":

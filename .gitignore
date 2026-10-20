@@ -20,3 +20,4 @@ db/*
 logs/*
 !logs/.gitignore
 artifacts/
+.artifacts/

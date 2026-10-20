@@ -40,6 +40,7 @@ class ImportTest(unittest.TestCase):
             b'First Name,Last Name,Chat ID\nHuge,User,99999999999999999999999\n',
             b'Wrong,Headers\nA,B\n',
             b'First Name,Last Name,Chat ID\n"Unclosed,Field,123\n',
+            b'First Name,Last Name,Chat ID,Subscribed\nValid,User,123,true\nBad,User,456,perhaps\n',
         ]
         for content in files:
             with self.subTest(content=content), self.assertRaises(ValueError):
@@ -92,3 +93,25 @@ class ImportTest(unittest.TestCase):
             self.assertEqual(other.list_clients(), self.repository.list_clients())
         finally:
             other.close()
+
+    def test_export_import_preserves_opt_out_and_never_resubscribes_existing_clients(self):
+        self.repository.get_or_create_client(123, 'Subscribed', '')
+        self.repository.get_or_create_client(456, 'Stopped', '', subscribed=False)
+        self.repository.import_clients(b'First Name,Last Name,Chat ID,Subscribed\nAgain,User,456,true\n')
+        self.assertFalse(self.repository.is_client_subscribed(456))
+        other = Repository(f'sqlite:///{(Path(self.directory.name) / "subscriptions.db").as_posix()}')
+        try:
+            other.initialize()
+            result = other.import_clients(self.repository.export_clients())
+            self.assertEqual(result.inserted, 2)
+            self.assertTrue(other.is_client_subscribed(123))
+            self.assertFalse(other.is_client_subscribed(456))
+            self.assertEqual(len(other.list_clients()), 2)
+        finally:
+            other.close()
+
+    def test_duplicate_csv_rows_cannot_override_opt_out(self):
+        content = b'First Name,Last Name,Chat ID,Subscribed\nFirst,User,123,true\nLater,User,123,false\nLast,User,123,true\n'
+        result = self.repository.import_clients(content)
+        self.assertEqual((result.inserted, result.duplicates, result.total), (1, 2, 3))
+        self.assertFalse(self.repository.is_client_subscribed(123))

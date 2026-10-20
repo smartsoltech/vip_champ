@@ -1,6 +1,6 @@
 services:
   telegram-bot:
-    image: vip-champ:${APP_REVISION:-development}
+    image: ${APP_IMAGE:-vip-champ:${APP_REVISION:-development}}
     build:
       context: .
       args:

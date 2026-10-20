@@ -29,6 +29,9 @@ class Settings:
     backup_dir: Path = PROJECT_ROOT / "db/backups"
     heartbeat_path: Path = PROJECT_ROOT / "db/heartbeat.json"
     health_max_age_seconds: int = 90
+    watchdog_timeout_seconds: int = 180
+    startup_timeout_seconds: int = 600
+    shutdown_timeout_seconds: int = 30
     auth_ttl_seconds: int = 3600
     state_ttl_seconds: int = 300
     auth_max_attempts: int = 5
@@ -112,6 +115,13 @@ def load_settings(
         raise ConfigurationError("BROADCAST_INTERVAL_SECONDS must be a number") from None
     if not math.isfinite(interval) or interval < 0.04:
         raise ConfigurationError("BROADCAST_INTERVAL_SECONDS must be >= 0.04")
+    health_max_age = _integer(environ, "HEALTH_MAX_AGE_SECONDS", 90, 45)
+    watchdog_timeout = _integer(environ, "WATCHDOG_TIMEOUT_SECONDS", 180, 60)
+    if watchdog_timeout <= health_max_age:
+        raise ConfigurationError("WATCHDOG_TIMEOUT_SECONDS must exceed HEALTH_MAX_AGE_SECONDS")
+    startup_timeout = _integer(environ, "STARTUP_TIMEOUT_SECONDS", 600, 60)
+    if startup_timeout < watchdog_timeout:
+        raise ConfigurationError("STARTUP_TIMEOUT_SECONDS must be >= WATCHDOG_TIMEOUT_SECONDS")
     return Settings(
         telegram_api_token=token,
         database_url=database_url,
@@ -121,7 +131,10 @@ def load_settings(
         post_chat_ids=tuple(dict.fromkeys(post_ids)),
         backup_dir=_path(environ, "BACKUP_DIR", "db/backups"),
         heartbeat_path=_path(environ, "HEARTBEAT_PATH", "db/heartbeat.json"),
-        health_max_age_seconds=_integer(environ, "HEALTH_MAX_AGE_SECONDS", 90, 45),
+        health_max_age_seconds=health_max_age,
+        watchdog_timeout_seconds=watchdog_timeout,
+        startup_timeout_seconds=startup_timeout,
+        shutdown_timeout_seconds=_integer(environ, "SHUTDOWN_TIMEOUT_SECONDS", 30, 5),
         auth_ttl_seconds=_integer(environ, "AUTH_TTL_SECONDS", 3600),
         state_ttl_seconds=_integer(environ, "STATE_TTL_SECONDS", 300),
         auth_max_attempts=_integer(environ, "AUTH_MAX_ATTEMPTS", 5),

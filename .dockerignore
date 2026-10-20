@@ -3,6 +3,7 @@
 !config.py
 !main.py
 !healthcheck.py
+!watchdog.py
 !bot.py
 !kb.py
 !db.py
@@ -12,4 +13,5 @@
 !scripts/
 !scripts/install_pg_client.sh
 !scripts/backup_database.py
+!scripts/preflight.py
 !scripts/migrate_sqlite_to_postgres.py

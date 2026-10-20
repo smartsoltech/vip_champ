@@ -12,7 +12,7 @@ import subprocess
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,11 +38,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from sqlalchemy.pool import StaticPool
 from werkzeug.security import check_password_hash, generate_password_hash
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_TELEGRAM_ID = (1 << 52) - 1
 MAX_CSV_BYTES = 10 * 1024 * 1024
 MAX_CSV_ROWS = 100_000
 CSV_COLUMNS = ('First Name', 'Last Name', 'Chat ID')
+CSV_SUBSCRIPTION_COLUMN = 'Subscribed'
 CSV_ESCAPE_COLUMN = 'CSV Encoding'
 CSV_ESCAPE_VERSION = 'apostrophe-v1'
 
@@ -93,6 +94,7 @@ class Client(Base):
     last_name: Mapped[str] = mapped_column(Text, nullable=False, default='', server_default='')
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
     is_bot: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text('false'))
+    is_subscribed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text('true'))
 
 
 class Setting(Base):
@@ -174,6 +176,7 @@ class ClientRecord:
     last_name: str
     chat_id: int
     is_bot: bool
+    is_subscribed: bool
 
 
 @dataclass(frozen=True)
@@ -196,7 +199,7 @@ def _admin_record(admin: Admin) -> AdminRecord:
 
 
 def _client_record(client: Client) -> ClientRecord:
-    return ClientRecord(client.id, client.first_name, client.last_name, client.chat_id, client.is_bot)
+    return ClientRecord(client.id, client.first_name, client.last_name, client.chat_id, client.is_bot, client.is_subscribed)
 
 
 def _escape_csv(value: str) -> str:
@@ -227,7 +230,15 @@ class Repository:
             options['connect_args'] = {'timeout': 30, 'check_same_thread': False}
             if self.database_path is None:
                 options['poolclass'] = StaticPool
+        else:
+            defaults = {'connect_timeout': 10, 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 10, 'keepalives_count': 3, 'tcp_user_timeout': 60000}
+            connect_args = {name: value for name, value in defaults.items() if name not in url.query}
+            # libpq applies repeated -c settings in order; explicit URL options win.
+            explicit_options = str(url.query.get('options', ''))
+            connect_args['options'] = '-c statement_timeout=30000 -c lock_timeout=5000' + (f' {explicit_options}' if explicit_options else '')
+            options['connect_args'] = connect_args
         self.engine = create_engine(url, **options)
+        self._memory_guard = threading.RLock() if self.dialect == 'sqlite' and self.database_path is None else None
         self._runtime_connection = None
         self._runtime_file = None
         self._runtime_guard = threading.RLock()
@@ -243,25 +254,32 @@ class Repository:
 
     @contextmanager
     def _session(self, *, write: bool = False) -> Iterator[Session]:
-        self._check_runtime_lock()
-        with Session(self.engine, expire_on_commit=False) as session:
-            try:
-                if write:
-                    if self.dialect == 'sqlite':
-                        session.execute(text('BEGIN IMMEDIATE'))
-                    else:
-                        # Serializes short compound decisions across application processes.
-                        session.execute(text('SELECT pg_advisory_xact_lock(867134940121)'))
-                yield session
-                if write:
-                    session.commit()
-            except BaseException:
-                session.rollback()
-                raise
+        # StaticPool has one physical connection: hold the lock until commit/rollback
+        # AND session close, including read sessions whose close performs a rollback.
+        with self._memory_guard or nullcontext():
+            self._check_runtime_lock()
+            with Session(self.engine, expire_on_commit=False) as session:
+                try:
+                    if write:
+                        if self.dialect == 'sqlite':
+                            session.execute(text('BEGIN IMMEDIATE'))
+                        else:
+                            session.execute(text('SELECT pg_advisory_xact_lock(867134940121)'))
+                    yield session
+                    if write:
+                        session.commit()
+                except BaseException:
+                    session.rollback()
+                    raise
 
     def initialize(self) -> MigrationReport:
+        with self._memory_guard or nullcontext():
+            return self._initialize()
+
+    def _initialize(self) -> MigrationReport:
         if self.database_path:
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        version = None
         with self.engine.connect() as connection:
             tables = set(inspect(connection).get_table_names())
             if tables.difference(Base.metadata.tables):
@@ -274,6 +292,10 @@ class Repository:
                     return MigrationReport()
                 if version and version > SCHEMA_VERSION:
                     raise ValueError('Database schema is newer than this application.')
+                if version == 1 and set(Base.metadata.tables).difference(tables):
+                    raise ValueError('Application schema is incomplete; restore it before migrating.')
+        if version == 1:
+            return self._migrate_v1()
         legacy_tables = tables.intersection({'clients', 'settings', 'admins'})
         if legacy_tables:
             if self.dialect != 'sqlite':
@@ -285,6 +307,24 @@ class Repository:
             Base.metadata.create_all(connection)
             connection.execute(SchemaVersion.__table__.insert().values(version=SCHEMA_VERSION, installed_at=utcnow()))
         return MigrationReport()
+
+    def _migrate_v1(self) -> MigrationReport:
+        backup = self.backup_database()
+        with self._session(write=True) as session:
+            # A second initializer may have finished while this one took its backup.
+            current = session.scalar(select(func.max(SchemaVersion.version)))
+            if current == SCHEMA_VERSION:
+                return MigrationReport(backup)
+            if current != 1:
+                raise ValueError('Unexpected schema version during migration.')
+            connection = session.connection()
+            columns = {column['name'] for column in inspect(connection).get_columns('clients')}
+            if 'is_subscribed' not in columns:
+                connection.exec_driver_sql('ALTER TABLE clients ADD COLUMN is_subscribed BOOLEAN NOT NULL DEFAULT TRUE')
+            client_count = session.scalar(select(func.count()).select_from(Client))
+            session.execute(SchemaVersion.__table__.delete())
+            session.add(SchemaVersion(version=SCHEMA_VERSION, installed_at=utcnow()))
+        return MigrationReport(backup, {'client_subscriptions': client_count})
 
     def _migrate_legacy(self, tables: set[str], backup: Path) -> MigrationReport:
         migrated = {name: 0 for name in tables}
@@ -308,10 +348,13 @@ class Repository:
                             bot_value = row.get('is_bot')
                             if bot_value not in (None, 0, 1, False, True):
                                 raise ValueError('Invalid is_bot value.')
+                            subscribed_value = row.get('is_subscribed', True)
+                            if subscribed_value not in (0, 1, False, True):
+                                raise ValueError('Invalid is_subscribed value.')
                             first_name, last_name = str(row.get('first_name') or ''), str(row.get('last_name') or '')
                             if '\x00' in first_name + last_name:
                                 raise ValueError('Client name contains a NUL character unsupported by PostgreSQL.')
-                            values = dict(chat_id=chat_id, first_name=first_name, last_name=last_name, is_bot=bool(bot_value))
+                            values = dict(chat_id=chat_id, first_name=first_name, last_name=last_name, is_bot=bool(bot_value), is_subscribed=bool(subscribed_value))
                             seen_key, model = chat_id, Client
                         elif table == 'admins':
                             username = _username(row.get('username'))
@@ -320,6 +363,8 @@ class Repository:
                             password_hash = row.get('password_hash')
                             if not password_hash and row.get('password'):
                                 legacy_password = str(row['password'])
+                                if self._looks_like_hash(legacy_password) and not self._supported_hash(legacy_password):
+                                    raise ValueError('Administrator password hash is unsupported or exceeds safe cost limits; reset credentials with CLI.')
                                 password_hash = legacy_password if self._supported_hash(legacy_password) else generate_password_hash(legacy_password)
                             if not self._supported_hash(password_hash):
                                 raise ValueError('Administrator has no supported password hash; reset credentials with CLI.')
@@ -359,7 +404,10 @@ class Repository:
                         payload = dict(row)
                         if payload.get('password'):
                             candidate = str(payload.pop('password'))
-                            payload['password_hash'] = candidate if self._supported_hash(candidate) else generate_password_hash(candidate)
+                            if self._supported_hash(candidate):
+                                payload['password_hash'] = candidate
+                            else:
+                                payload['credential_fingerprint'] = hashlib.sha256(candidate.encode('utf-8')).hexdigest()
                         else:
                             payload.pop('password', None)
                         if payload.get('password_hash') and not self._supported_hash(payload['password_hash']):
@@ -375,15 +423,36 @@ class Repository:
 
     @staticmethod
     def _supported_hash(value: object) -> bool:
-        if not isinstance(value, str) or not value.startswith(('scrypt:', 'pbkdf2:')):
+        # Parse cost parameters before invoking a KDF. Imported hashes must never
+        # request unbounded CPU/memory or unsupported algorithms during login.
+        if not isinstance(value, str) or len(value) > 1024:
             return False
         parts = value.split('$')
-        return len(parts) == 3 and bool(parts[1]) and bool(re.fullmatch(r'[0-9a-fA-F]+', parts[2])) and '\x00' not in value
+        if len(parts) != 3 or not re.fullmatch(r'[\x21-\x7e]{1,64}', parts[1]) or not re.fullmatch(r'[0-9a-f]+', parts[2]):
+            return False
+        method, _salt, digest = parts
+        parameters = method.split(':')
+        if parameters[0] == 'pbkdf2' and len(parameters) == 3:
+            lengths = {'sha1': 40, 'sha224': 56, 'sha256': 64, 'sha384': 96, 'sha512': 128}
+            return (parameters[1] in lengths and len(digest) == lengths[parameters[1]]
+                    and bool(re.fullmatch(r'[0-9]{1,7}', parameters[2]))
+                    and 1 <= int(parameters[2]) <= 2_000_000)
+        if parameters[0] == 'scrypt' and len(parameters) == 4 and all(re.fullmatch(r'[0-9]{1,7}', part) for part in parameters[1:]):
+            n, r, p = map(int, parameters[1:])
+            return (len(digest) == 128 and 2 <= n <= 2**18 and n & (n - 1) == 0
+                    and 1 <= r <= 32 and 1 <= p <= 16
+                    and n < 2 ** (16 * r)
+                    and 128 * n * r <= 128 * 1024 * 1024 and n * r * p <= 2**22
+                    and 128 * (n + p + 2) <= 132 * n * p)
+        return False
+
+    @staticmethod
+    def _looks_like_hash(value: str) -> bool:
+        return bool(re.match(r'^(?:scrypt|pbkdf2|md5|sha1|sha256|sha512)(?:[:$])', value))
 
     def ping(self) -> bool:
-        self._check_runtime_lock()
-        with self.engine.connect() as connection:
-            return connection.execute(text('SELECT 1')).scalar() == 1
+        with self._session() as session:
+            return session.execute(text('SELECT 1')).scalar() == 1
 
     def acquire_runtime_lock(self) -> None:
         """Hold a process-lifetime singleton lease before polling or outbox recovery."""
@@ -501,19 +570,54 @@ class Repository:
             else:
                 setting.value = value
 
-    def get_or_create_client(self, chat_id: int, first_name: str | None, last_name: str | None, is_bot: bool = False) -> ClientRecord | None:
+    def get_or_create_client(self, chat_id: int, first_name: str | None, last_name: str | None, is_bot: bool = False, *, subscribed: bool | None = None) -> ClientRecord | None:
         chat_id = validate_telegram_id(chat_id)
+        if subscribed is not None and not isinstance(subscribed, bool):
+            raise ValueError('Subscription must be a boolean.')
         if is_bot:
             return None
         with self._session(write=True) as session:
             client = session.scalar(select(Client).where(Client.chat_id == chat_id))
             if client is None:
-                client = Client(chat_id=chat_id, first_name=first_name or '', last_name=last_name or '', is_bot=False)
+                client = Client(chat_id=chat_id, first_name=first_name or '', last_name=last_name or '', is_bot=False, is_subscribed=True if subscribed is None else subscribed)
                 session.add(client)
                 session.flush()
             else:
                 client.first_name, client.last_name, client.is_bot = first_name or '', last_name or '', False
+                if subscribed is not None:
+                    client.is_subscribed = subscribed
+            if subscribed is False:
+                self._cancel_client_pending(session, chat_id)
             return _client_record(client)
+
+    def set_client_subscription(self, chat_id: int, subscribed: bool) -> None:
+        chat_id = validate_telegram_id(chat_id)
+        if not isinstance(subscribed, bool):
+            raise ValueError('Subscription must be a boolean.')
+        with self._session(write=True) as session:
+            client = session.scalar(select(Client).where(Client.chat_id == chat_id))
+            if client is None:
+                client = Client(chat_id=chat_id, first_name='', last_name='', is_bot=False, is_subscribed=subscribed)
+                session.add(client)
+            else:
+                client.is_subscribed = subscribed
+            if not subscribed:
+                self._cancel_client_pending(session, chat_id)
+
+    def is_client_subscribed(self, chat_id: int) -> bool:
+        chat_id = validate_telegram_id(chat_id)
+        with self._session() as session:
+            return session.scalar(select(Client.id).where(Client.chat_id == chat_id, Client.is_subscribed.is_(True), Client.is_bot.is_(False))) is not None
+
+    def _cancel_client_pending(self, session: Session, chat_id: int) -> None:
+        recipients = session.scalars(select(BroadcastRecipient).where(BroadcastRecipient.chat_id == chat_id, BroadcastRecipient.status == 'pending')).all()
+        touched = {recipient.job_id for recipient in recipients}
+        for recipient in recipients:
+            recipient.status = 'canceled'
+            recipient.error = 'Client unsubscribed before delivery.'
+        session.flush()
+        for job_id in touched:
+            self._complete_broadcast_if_finished(session, job_id)
 
     def list_clients(self) -> list[dict]:
         with self._session() as session:
@@ -538,6 +642,8 @@ class Repository:
             if not admin or admin.telegram_id != telegram_id:
                 return None
             digest = admin.password_hash
+            if not self._supported_hash(digest):
+                return None
             try:
                 valid = check_password_hash(digest, password)
             except (ValueError, TypeError, OverflowError):
@@ -612,7 +718,7 @@ class Repository:
             if admin.is_superadmin and session.scalar(select(func.count()).select_from(Admin).where(Admin.is_superadmin.is_(True))) <= 1:
                 raise ValueError('Cannot remove the last superadministrator.')
             for job in session.scalars(select(BroadcastJob).where(BroadcastJob.actor_id == admin.telegram_id, BroadcastJob.status == 'pending')):
-                job.status = 'canceled'
+                self._cancel_broadcast(session, job)
             session.delete(admin)
             return True
 
@@ -632,7 +738,7 @@ class Repository:
             legacy = {'mention', 'nickname', 'id'}.issubset(headers)
             if not canonical and not legacy:
                 raise ValueError('CSV requires First Name, Last Name, Chat ID or mention, nickname, id columns.')
-            rows: dict[int, tuple[str, str]] = {}
+            rows: dict[int, tuple[str, str, bool]] = {}
             total = 0
             for number, row in enumerate(reader, 2):
                 total += 1
@@ -651,7 +757,14 @@ class Repository:
                     raise ValueError(f'CSV row {number}: {error}') from error
                 if len(first) > 1024 or len(last) > 1024 or '\x00' in first + last:
                     raise ValueError(f'CSV row {number} has an invalid name.')
-                rows.setdefault(chat_id, (first, last))
+                subscription = row.get(CSV_SUBSCRIPTION_COLUMN, 'true').strip().lower()
+                if subscription not in ('true', 'false'):
+                    raise ValueError(f'CSV row {number} has an invalid Subscribed value; use true or false.')
+                rows.setdefault(chat_id, (first, last, subscription == 'true'))
+                if subscription == 'false':
+                    # A duplicate row must never override an explicit opt-out.
+                    previous_first, previous_last, _ = rows[chat_id]
+                    rows[chat_id] = (previous_first, previous_last, False)
         except csv.Error as error:
             raise ValueError('Malformed CSV file.') from error
         if rows:
@@ -660,57 +773,82 @@ class Repository:
         with self._session(write=True) as session:
             self._require_actor(session, actor_id, expected_auth_revision)
             existing = set(session.scalars(select(Client.chat_id)))
-            for chat_id, (first, last) in rows.items():
+            for chat_id, (first, last, subscribed) in rows.items():
                 if chat_id not in existing:
-                    session.add(Client(first_name=first, last_name=last, chat_id=chat_id, is_bot=False))
+                    session.add(Client(first_name=first, last_name=last, chat_id=chat_id, is_bot=False, is_subscribed=subscribed))
                     inserted += 1
         return ImportResult(inserted, total - inserted, total)
 
     def export_clients(self) -> bytes:
         output = io.StringIO(newline='')
         writer = csv.writer(output)
-        writer.writerow((*CSV_COLUMNS, CSV_ESCAPE_COLUMN))
-        for client in self.list_clients():
-            writer.writerow((_escape_csv(client['first_name']), _escape_csv(client['last_name']), client['chat_id'], CSV_ESCAPE_VERSION))
+        writer.writerow((*CSV_COLUMNS, CSV_ESCAPE_COLUMN, CSV_SUBSCRIPTION_COLUMN))
+        with self._session() as session:
+            for client in session.scalars(select(Client).where(Client.is_bot.is_(False)).order_by(Client.id)):
+                writer.writerow((_escape_csv(client.first_name), _escape_csv(client.last_name), client.chat_id, CSV_ESCAPE_VERSION, str(client.is_subscribed).lower()))
         return output.getvalue().encode('utf-8-sig')
 
     def backup_database(self) -> Path:
+        with self._memory_guard or nullcontext():
+            return self._backup_database()
+
+    def _backup_database(self) -> Path:
         self.backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         suffix = 'dump' if self.dialect == 'postgresql' else 'db'
         target = self.backup_dir / f'backup_{datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")}_{uuid.uuid4().hex}.{suffix}'
+        partial = target.with_suffix(target.suffix + '.partial')
         # Restrict permissions before writing any personal data or password hashes.
-        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(descriptor)
-        if self.dialect == 'postgresql':
-            environment = os.environ.copy()
-            for name, value in {'PGHOST': self.url.host, 'PGPORT': self.url.port or 5432, 'PGDATABASE': self.url.database, 'PGUSER': self.url.username, 'PGPASSWORD': self.url.password, 'PGSSLMODE': self.url.query.get('sslmode')}.items():
-                if value is not None:
-                    environment[name] = str(value)
-            try:
-                result = subprocess.run(['pg_dump', '--no-password', '--format=custom', '--no-owner', '--file', str(target)], env=environment, capture_output=True, timeout=300, check=False)
-            except (OSError, subprocess.TimeoutExpired) as error:
-                raise RuntimeError('PostgreSQL backup could not run; no database changes were made.') from error
-            if result.returncode != 0 or not target.exists() or not target.stat().st_size:
-                raise RuntimeError('PostgreSQL backup failed; check database connectivity and pg_dump compatibility.')
-        else:
-            destination = sqlite3.connect(target)
-            try:
-                if self.database_path:
-                    source = sqlite3.connect(self.database_path.as_uri() + '?mode=ro', uri=True, timeout=30)
-                    try:
-                        source.backup(destination)
-                    finally:
-                        source.close()
-                else:
-                    raw = self.engine.raw_connection()
-                    try:
-                        raw.driver_connection.backup(destination)
-                    finally:
-                        raw.close()
-            finally:
-                destination.close()
-        target.chmod(0o600)
-        return target
+        try:
+            if self.dialect == 'postgresql':
+                environment = os.environ.copy()
+                for name, value in {
+                    'PGHOST': self.url.host, 'PGPORT': self.url.port or 5432,
+                    'PGDATABASE': self.url.database, 'PGUSER': self.url.username,
+                    'PGPASSWORD': self.url.password, 'PGCONNECT_TIMEOUT': self.url.query.get('connect_timeout', 10),
+                    'PGSSLMODE': self.url.query.get('sslmode'), 'PGSSLROOTCERT': self.url.query.get('sslrootcert'),
+                    'PGSSLCERT': self.url.query.get('sslcert'), 'PGSSLKEY': self.url.query.get('sslkey'),
+                    'PGSSLCRL': self.url.query.get('sslcrl'), 'PGSSLCRLDIR': self.url.query.get('sslcrldir'),
+                }.items():
+                    if value is not None:
+                        environment[name] = str(value)
+                try:
+                    # Native backup has its own deadline; application query limits
+                    # are intentionally not passed to pg_dump.
+                    result = subprocess.run(['pg_dump', '--no-password', '--format=custom', '--no-owner', '--file', str(partial)], env=environment, capture_output=True, timeout=300, check=False)
+                    if result.returncode != 0 or not partial.stat().st_size:
+                        raise RuntimeError('PostgreSQL backup failed; check database connectivity and pg_dump compatibility.')
+                    verified = subprocess.run(['pg_restore', '--list', str(partial)], capture_output=True, timeout=60, check=False)
+                    if verified.returncode != 0:
+                        raise RuntimeError('PostgreSQL backup archive validation failed.')
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    raise RuntimeError('PostgreSQL backup could not complete; no database changes were made.') from error
+            else:
+                destination = sqlite3.connect(partial)
+                try:
+                    if self.database_path:
+                        source = sqlite3.connect(self.database_path.as_uri() + '?mode=ro', uri=True, timeout=30)
+                        try:
+                            source.backup(destination)
+                        finally:
+                            source.close()
+                    else:
+                        raw = self.engine.raw_connection()
+                        try:
+                            raw.driver_connection.backup(destination)
+                        finally:
+                            raw.close()
+                    if destination.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
+                        raise RuntimeError('SQLite backup validation failed.')
+                finally:
+                    destination.close()
+            partial.chmod(0o600)
+            # Only validated, complete archives have the public backup suffix.
+            os.replace(partial, target)
+            return target
+        finally:
+            partial.unlink(missing_ok=True)
 
     def create_broadcast(self, actor_id: int, text: str, *, expected_auth_revision: str | None = None) -> int:
         actor_id = validate_telegram_id(actor_id, user_only=True)
@@ -718,7 +856,7 @@ class Repository:
             raise ValueError('Broadcast text must contain 1 to 4096 characters.')
         with self._session(write=True) as session:
             self._require_actor(session, actor_id, expected_auth_revision)
-            clients = session.scalars(select(Client).where(Client.is_bot.is_(False))).all()
+            clients = session.scalars(select(Client).where(Client.is_bot.is_(False), Client.is_subscribed.is_(True))).all()
             job = BroadcastJob(actor_id=actor_id, text=text, status='pending' if clients else 'completed', created_at=utcnow())
             session.add(job)
             session.flush()
@@ -737,8 +875,14 @@ class Repository:
             if not job or job.status != 'pending':
                 return []
             if session.scalar(select(Admin.id).where(Admin.telegram_id == job.actor_id)) is None:
-                job.status = 'canceled'
+                self._cancel_broadcast(session, job)
                 return []
+            available = select(Client.chat_id).where(Client.is_bot.is_(False), Client.is_subscribed.is_(True))
+            for recipient in session.scalars(select(BroadcastRecipient).where(BroadcastRecipient.job_id == job_id, BroadcastRecipient.status == 'pending', BroadcastRecipient.chat_id.not_in(available))):
+                recipient.status = 'canceled'
+                recipient.error = 'Client unsubscribed before delivery.'
+            session.flush()
+            self._complete_broadcast_if_finished(session, job_id)
             recipients = session.scalars(select(BroadcastRecipient).where(BroadcastRecipient.job_id == job_id, BroadcastRecipient.status == 'pending', BroadcastRecipient.next_attempt <= datetime.now(UTC).timestamp()).order_by(BroadcastRecipient.id).limit(limit)).all()
             result = []
             for recipient in recipients:
@@ -748,7 +892,7 @@ class Repository:
             return result
 
     def record_broadcast_result(self, job_id: int, chat_id: int, status: str = 'sent', error: str | None = None, retry_after: float | None = None, attempt: int | None = None) -> None:
-        if status not in ('sent', 'failed', 'uncertain', 'pending'):
+        if status not in ('sent', 'failed', 'uncertain', 'pending', 'canceled'):
             raise ValueError('Invalid broadcast delivery status.')
         with self._session(write=True) as session:
             recipient = session.scalar(select(BroadcastRecipient).where(BroadcastRecipient.job_id == job_id, BroadcastRecipient.chat_id == chat_id))
@@ -762,32 +906,72 @@ class Repository:
                     raise ValueError('Broadcast attempt has not been claimed.')
             if recipient.status == status and recipient.error == normalized_error:
                 return
+            if recipient.status == 'canceled' and status == 'pending':
+                # Retrying persistence after a successful commit must not revive
+                # a retry that cancellation/opt-out already made terminal.
+                return
             if recipient.status != 'sending':
                 raise ValueError('Only a claimed delivery may be completed or retried.')
             recipient.status = status
             recipient.error = normalized_error
             recipient.next_attempt = datetime.now(UTC).timestamp() + max(0.0, float(retry_after or 0)) if status == 'pending' else 0.0
             session.flush()
-            active = session.scalar(select(func.count()).select_from(BroadcastRecipient).where(BroadcastRecipient.job_id == job_id, BroadcastRecipient.status.in_(('pending', 'sending'))))
-            job = session.get(BroadcastJob, job_id)
-            if not active and job.status == 'pending':
-                job.status = 'completed'
+            # A rate-limited in-flight attempt must not recreate pending work
+            # after the job was canceled or the client opted out.
+            if status == 'pending':
+                job = session.get(BroadcastJob, job_id)
+                subscribed = session.scalar(select(Client.id).where(Client.chat_id == chat_id, Client.is_subscribed.is_(True), Client.is_bot.is_(False))) is not None
+                if job.status == 'canceled' or not subscribed:
+                    recipient.status = 'canceled'
+                    recipient.next_attempt = 0.0
+            session.flush()
+            self._complete_broadcast_if_finished(session, job_id)
+
+    def _complete_broadcast_if_finished(self, session: Session, job_id: int) -> None:
+        active = session.scalar(select(func.count()).select_from(BroadcastRecipient).where(BroadcastRecipient.job_id == job_id, BroadcastRecipient.status.in_(('pending', 'sending'))))
+        job = session.get(BroadcastJob, job_id)
+        if not active and job.status == 'pending':
+            job.status = 'completed'
 
     def get_broadcast_status(self, job_id: int) -> dict:
         with self._session() as session:
             job = session.get(BroadcastJob, job_id)
             if not job:
                 raise ValueError('Broadcast job not found.')
-            result = dict(id=job.id, actor_id=job.actor_id, text=job.text, status=job.status, pending=0, sending=0, sent=0, failed=0, uncertain=0)
+            result = dict(id=job.id, actor_id=job.actor_id, text=job.text, status=job.status, pending=0, sending=0, sent=0, failed=0, uncertain=0, canceled=0)
             for status, count in session.execute(select(BroadcastRecipient.status, func.count()).where(BroadcastRecipient.job_id == job_id).group_by(BroadcastRecipient.status)):
                 result[status] = count
             return result
 
     def cancel_broadcast(self, job_id: int) -> None:
+        """Trusted worker cancellation after detecting that its actor was revoked."""
         with self._session(write=True) as session:
             job = session.get(BroadcastJob, job_id)
             if job and job.status == 'pending':
-                job.status = 'canceled'
+                self._cancel_broadcast(session, job)
+
+    def request_cancel_broadcast(self, job_id: int, actor_id: int, expected_auth_revision: str) -> bool:
+        actor_id = validate_telegram_id(actor_id, user_only=True)
+        if not isinstance(expected_auth_revision, str) or not expected_auth_revision:
+            raise PermissionError('Current administrator authentication is required.')
+        with self._session(write=True) as session:
+            actor = self._require_actor(session, actor_id, expected_auth_revision)
+            job = session.get(BroadcastJob, job_id)
+            if job is None:
+                raise ValueError('Broadcast job not found.')
+            if actor.telegram_id != job.actor_id and not actor.is_superadmin:
+                raise PermissionError('Only the broadcast owner or a superadministrator may cancel it.')
+            if job.status != 'pending':
+                return False
+            self._cancel_broadcast(session, job)
+            return True
+
+    @staticmethod
+    def _cancel_broadcast(session: Session, job: BroadcastJob) -> None:
+        job.status = 'canceled'
+        for recipient in session.scalars(select(BroadcastRecipient).where(BroadcastRecipient.job_id == job.id, BroadcastRecipient.status == 'pending')):
+            recipient.status = 'canceled'
+            recipient.error = 'Broadcast canceled before delivery.'
 
     def recover_broadcasts(self) -> int:
         with self._session(write=True) as session:
