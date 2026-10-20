@@ -140,6 +140,58 @@ class BotBehaviorTests(unittest.TestCase):
     def client(self, chat_id=CLIENT):
         self.repo.get_or_create_client(chat_id, "Demo", "Client", False)
 
+    def test_admin_aliases_require_login_and_open_owner_menu_after_valid_credentials(self):
+        for command in ("/admin", "/admin@audit_bot"):
+            with self.subTest(command=command):
+                self.app.handle_message(message(command))
+                self.assertNotIn((OWNER, OWNER), self.app._sessions)
+                self.assertEqual(self.app._states[(OWNER, OWNER)].action, "login")
+                self.assertIsNone(self.bot.sent[-1].markup)
+                self.assertIn("логин и пароль", self.bot.sent[-1].text)
+                self.app.handle_message(message(f"owner {PASSWORD}"))
+                self.assertIn((OWNER, OWNER), self.app._sessions)
+                self.assertIsNotNone(self.bot.sent[-1].markup)
+                buttons = [
+                    button
+                    for row in self.bot.sent[-1].markup.to_dict()["inline_keyboard"]
+                    for button in row
+                ]
+                self.assertTrue(any(button["callback_data"].endswith(":add_superadmin") for button in buttons))
+
+    def test_admin_alias_does_not_grant_privileges_before_password_login(self):
+        self.client()
+        self.app.handle_message(message("/admin"))
+        self.app.handle_message(message("/export_clients"))
+        self.app.handle_message(message("/post_channel"))
+        self.app.handle_message(message("unauthorized publication"))
+        self.assertNotIn((OWNER, OWNER), self.app._sessions)
+        self.assertEqual(self.bot.documents, [])
+        self.assertTrue(all(item.chat.id == OWNER for item in self.bot.sent))
+        self.assertTrue(all(item.markup is None for item in self.bot.sent))
+
+    def test_admin_alias_rejects_owner_credentials_from_another_telegram_id(self):
+        self.app.handle_message(message("/admin@audit_bot", CLIENT))
+        self.app.handle_message(message(f"owner {PASSWORD}", CLIENT))
+        self.app.handle_message(message("/export_clients", CLIENT))
+        self.assertNotIn((CLIENT, CLIENT), self.app._sessions)
+        self.assertIsNone(self.repo.get_admin_by_telegram_id(CLIENT))
+        self.assertEqual(self.bot.documents, [])
+        self.assertTrue(all(item.markup is None for item in self.bot.sent))
+
+    def test_admin_aliases_enforce_private_chat_guard(self):
+        with patch.object(self.repo, "authenticate_admin", wraps=self.repo.authenticate_admin) as auth:
+            for command in ("/admin", "/admin@audit_bot"):
+                with self.subTest(command=command):
+                    before = len(self.bot.sent)
+                    self.app.handle_message(message(command, chat=-50, chat_type="group"))
+                    self.assertEqual(len(self.bot.sent), before + 1)
+                    self.assertIn("только в личном чате", self.bot.sent[-1].text)
+                    self.app.handle_message(message(f"owner {PASSWORD}", chat=-50, chat_type="group"))
+            auth.assert_not_called()
+        self.assertEqual(self.app._states, {})
+        self.assertEqual(self.app._sessions, {})
+        self.assertEqual(self.bot.documents, [])
+
     def test_public_post_is_denied_and_no_fixed_destination_remains(self):
         self.app.handle_message(message("/post_channel", CLIENT))
         self.app.handle_message(message("unauthorized post", CLIENT))

@@ -69,7 +69,8 @@ recovering and processing the same broadcast queue concurrently.
 ## Bot administration
 
 Administrative operations are accepted only in private chats and are bound to
-the sender's numeric Telegram user ID. `/settings` starts password login.
+the sender's numeric Telegram user ID. `/admin` (or `/settings`) starts password
+login; both commands use the same authentication and are private-chat only.
 Admin menu buttons are bound to the authenticated sender and message and expire.
 `/start` and `/cancel` discard the current input flow.
 

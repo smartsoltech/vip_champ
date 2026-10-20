@@ -230,6 +230,8 @@ class BotApplication:
         command = None
         if isinstance(text, str) and text.startswith("/"):
             command = text.split(maxsplit=1)[0][1:].split("@", 1)[0].lower()
+            if command == "admin":
+                command = "settings"
         if not self._private(message):
             if command in _ACTIONS | {"settings", "get_settings", "broadcast_status", "cancel"}:
                 self._safe_notice(message.chat.id, "Управление доступно только в личном чате с ботом.")
@@ -267,7 +269,7 @@ class BotApplication:
             self._begin_action(message, command)
             return
         if command:
-            self._send(message.chat.id, "Неизвестная команда. /start — меню, /cancel — отмена.")
+            self._send(message.chat.id, "Неизвестная команда. /start — меню, /admin — управление, /cancel — отмена.")
             return
         with self._lock:
             state = self._states.get(key)
