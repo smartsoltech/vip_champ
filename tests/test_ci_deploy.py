@@ -3,6 +3,8 @@
 import hashlib
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,7 +44,7 @@ with Path(os.environ['MOCK_CI_LOG']).open('a') as log:
 """
 
 
-def run_ci(tmp_path, *, invalid_hash=False, stale_revision=False):
+def run_ci(tmp_path, *, invalid_hash=False, stale_revision=False, portable_checksum=False):
     artifact_dir = tmp_path / ".artifacts"
     artifact_dir.mkdir()
     archive = b"checked image archive"
@@ -56,6 +58,14 @@ def run_ci(tmp_path, *, invalid_hash=False, stale_revision=False):
         path = binaries / name
         path.write_text(FAKE)
         path.chmod(0o700)
+    if portable_checksum:
+        # BusyBox rejects the GNU long options. Keep that constraint in GNU CI too.
+        checksum = binaries / "sha256sum"
+        checksum.write_text(
+            "#!/bin/sh\nfor arg\ndo\ncase \"$arg\" in --*) exit 64;; esac\ndone\n"
+            f"exec {shlex.quote(shutil.which('sha256sum'))} \"$@\"\n",
+        )
+        checksum.chmod(0o700)
     log = tmp_path / "calls.jsonl"
     environment = dict(
         os.environ, PATH=f"{binaries}:{os.environ['PATH']}", MOCK_CI_LOG=str(log),
@@ -92,3 +102,14 @@ def test_invalid_artifact_stops_before_any_remote_access(tmp_path, failure):
     result, calls = run_ci(tmp_path, invalid_hash=failure == "hash", stale_revision=failure == "revision")
     assert result.returncode != 0
     assert calls == []
+
+
+@pytest.mark.parametrize("invalid_hash", [False, True])
+def test_checksum_gate_supports_busybox_options_and_rejects_corruption(tmp_path, invalid_hash):
+    result, calls = run_ci(tmp_path, portable_checksum=True, invalid_hash=invalid_hash)
+    if invalid_hash:
+        assert result.returncode != 0
+        assert calls == []
+    else:
+        assert result.returncode == 0, result.stderr
+        assert any("stdin_hash" in call for call in calls)

@@ -26,7 +26,7 @@ case "$image_digest" in *[!0-9a-f]*|"") exit 2 ;; esac
 image_hash=$(cat .artifacts/image-sha256)
 case "$image_hash" in *[!0-9a-f]*|"") exit 2 ;; esac
 [ "${#image_hash}" -eq 64 ]
-printf '%s  %s\n' "$image_hash" .artifacts/image.tar.gz | sha256sum --check --status
+printf '%s  %s\n' "$image_hash" .artifacts/image.tar.gz | sha256sum -c >/dev/null
 
 ssh_dir=$(mktemp -d)
 remote_dir=""
