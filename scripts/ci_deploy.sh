@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 # Only called by the protected master push pipeline after verification.
+set +x
 set -eu
 umask 077
 : "${DRONE_COMMIT_SHA:?}"
@@ -8,6 +9,12 @@ umask 077
 : "${DEPLOY_SSH_KEY:?}"
 : "${DEPLOY_KNOWN_HOSTS:?}"
 : "${DEPLOY_PATH:?}"
+case "${TELEGRAM_API_TOKEN:-}" in
+  ""|CHANGE_ME_IN_DRONE_SETTINGS)
+    echo "Set Drone secret vip_champ_telegram_api_token before deployment." >&2
+    exit 1
+    ;;
+esac
 case "$DEPLOY_HOST:$DEPLOY_USER:$DEPLOY_PATH" in
   *[!a-zA-Z0-9._:/@-]*) echo "Unsupported deployment target characters" >&2; exit 2 ;;
 esac
@@ -26,6 +33,6 @@ scp -i "$ssh_dir/key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnown
   /tmp/vip-champ-release.tar.gz "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
 scp -i "$ssh_dir/key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$ssh_dir/known_hosts" \
   scripts/deploy.sh "$DEPLOY_USER@$DEPLOY_HOST:$remote_script"
-ssh -i "$ssh_dir/key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+printf '%s' "$TELEGRAM_API_TOKEN" | ssh -i "$ssh_dir/key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$ssh_dir/known_hosts" \
   "$DEPLOY_USER@$DEPLOY_HOST" \
   "bash '$remote_script' '$DEPLOY_PATH' '$DRONE_COMMIT_SHA' '$remote_archive' '$archive_hash'"

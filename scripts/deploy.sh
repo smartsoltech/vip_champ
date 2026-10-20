@@ -42,6 +42,7 @@ if tar -tvf "$archive" | awk 'substr($1,1,1) == "l" || substr($1,1,1) == "h" {fo
   exit 1
 fi
 tar --extract --file="$archive" --directory="$release" --no-same-owner --no-same-permissions
+python3 "$release/scripts/set_bot_token.py" "$deploy_path/shared/.env"
 printf '%s\n' "$revision" > "$release/REVISION"
 export ENV_FILE="$deploy_path/shared/.env"
 export DB_HOST_DIR="$deploy_path/shared/db"

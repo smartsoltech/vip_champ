@@ -57,6 +57,8 @@ steps:
         from_secret: vip_champ_deploy_known_hosts
       DEPLOY_PATH:
         from_secret: vip_champ_deploy_path
+      TELEGRAM_API_TOKEN:
+        from_secret: vip_champ_telegram_api_token
     commands:
       - apk add --no-cache git openssh-client
       - sh scripts/ci_deploy.sh

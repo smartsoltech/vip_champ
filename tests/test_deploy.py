@@ -18,6 +18,7 @@ pytestmark = pytest.mark.skipif(
 REVISION = "a" * 40
 PREVIOUS = "b" * 40
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/deploy.sh"
+TOKEN_WRITER = SCRIPT.with_name("set_bot_token.py")
 
 DOCKER = """#!/usr/bin/env python3
 import os
@@ -72,6 +73,7 @@ def run_deploy(tmp_path, *, previous=False, config_fail=False, backup_fail=False
         info = tarfile.TarInfo("docker-compose.yml")
         info.size = len(content)
         tar.addfile(info, io.BytesIO(content))
+        tar.add(TOKEN_WRITER, arcname="scripts/set_bot_token.py")
         if symlink:
             info = tarfile.TarInfo("escape")
             info.type = tarfile.SYMTYPE
@@ -98,7 +100,8 @@ def run_deploy(tmp_path, *, previous=False, config_fail=False, backup_fail=False
     result = subprocess.run(
         ["bash", str(SCRIPT), str(root), REVISION, str(archive),
          hashlib.sha256(archive.read_bytes()).hexdigest()],
-        env=environment, text=True, capture_output=True, timeout=45,
+        env=environment, text=True, input="12345:" + "t" * 35,
+        capture_output=True, timeout=45,
     )
     calls = log.read_text() if log.exists() else ""
     return result, root, old_release, calls

@@ -156,15 +156,24 @@ Configure these repository-scoped Drone secrets on the approved runner:
 | `vip_champ_deploy_key` | Dedicated SSH private key |
 | `vip_champ_deploy_known_hosts` | Independently verified SSH host key entry |
 | `vip_champ_deploy_path` | Absolute application directory on that host |
+| `vip_champ_telegram_api_token` | Live bot token; available only to the deploy step, never pull requests |
 
-The host must have Docker Engine, the Compose plugin, Bash, tar, `flock`, and
+The host must have Docker Engine, the Compose plugin, Python 3, Bash, tar, `flock`, and
 `sha256sum`. The approved application target is LXC 138 (`192.168.50.250`),
 Debian 13, 2 vCPU, 2 GiB RAM, 24 GiB disk, with Docker 26 and deployment directory
 `/opt/vip_champ`. No existing application container is replaced.
 Before first deployment
 create `DEPLOY_PATH/shared/.env` with mode `0600` and prepare
 `DEPLOY_PATH/shared/db/backups` for UID/GID `10001:10001`.
-The external `.env` contains the live bot token and PostgreSQL connection.
+Set the bot token in Drone repository Settings → Secrets as
+`vip_champ_telegram_api_token`. The initial value `CHANGE_ME_IN_DRONE_SETTINGS`
+is a placeholder and deliberately prevents deployment. After replacing it,
+restart the latest push pipeline; later pushes to `master` deploy automatically.
+The token travels over SSH standard input, never in command-line arguments,
+Git files or image build arguments. Under the deployment lock, a helper validates
+it and atomically updates only `TELEGRAM_API_TOKEN` in the external `.env`,
+preserving the PostgreSQL connection and other settings with file mode `0600`.
+The external `.env` is the runtime copy; manage the token's source value in Drone.
 The shared PostgreSQL server currently has SSL disabled. This existing server
 setting has not been changed; the application's database connection is therefore
 not protected by PostgreSQL TLS. Enabling TLS requires a separate coordinated
