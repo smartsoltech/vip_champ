@@ -20,8 +20,10 @@ exec 9>"$deploy_path/deploy.lock"
 flock -n 9 || { echo "A deployment is already running" >&2; exit 1; }
 printf '%s  %s\n' "$archive_hash" "$archive" | sha256sum --check --status
 [[ -f "$deploy_path/shared/.env" ]] || { echo "Missing externally managed shared/.env" >&2; exit 1; }
-[[ -d "$deploy_path/shared/db/backups" ]] || {
-  echo "Prepare shared/db/backups with ownership 10001:10001 and mode 0700 first." >&2
+# The deploy user cannot traverse this 0700 directory owned by runtime UID 10001.
+# Validate its presence here; the backup helper validates/creates its child as UID 10001.
+[[ -d "$deploy_path/shared/db" ]] || {
+  echo "Prepare shared/db with ownership 10001:10001 and mode 0700 first." >&2
   exit 1
 }
 env_permissions=$(stat -c '%a' "$deploy_path/shared/.env")
