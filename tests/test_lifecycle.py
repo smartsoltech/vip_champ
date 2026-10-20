@@ -94,6 +94,8 @@ class LifecycleHarness:
         self.initialize_hook = lambda: None
         self.start_worker_hook = lambda: None
         self.watchdog_now = 100.0
+        self.clock = lambda: self.watchdog_now
+        self.worker_cycle = Event()
         self.watchdog = None
         self.watchdog_exits = []
         self.poll_hook = lambda bot: self.request_stop()
@@ -130,9 +132,19 @@ class LifecycleHarness:
 
         def setup(bot, repository, settings):
             app = real_setup(bot, repository, settings)
+            # Progress timestamps and watchdog deadlines must share an epoch;
+            # host monotonic uptime differs between fresh CI VMs and developer PCs.
+            app.clock = self.clock
+            app.last_worker_progress = self.clock()
             self.application = app
             original_start = app.start
             original_stop = app.stop
+            original_process = app.process_broadcast_once
+
+            def process():
+                result = original_process()
+                self.worker_cycle.set()
+                return result
 
             def start():
                 original_start()
@@ -147,6 +159,7 @@ class LifecycleHarness:
 
             app.start = start
             app.stop = stop
+            app.process_broadcast_once = process
             return app
 
         def set_signal(signum, handler):
@@ -158,7 +171,7 @@ class LifecycleHarness:
         watchdog_type = main.LivenessWatchdog
 
         def make_watchdog(*args, **kwargs):
-            self.watchdog = watchdog_type(*args, **kwargs, clock=lambda: self.watchdog_now, terminate=self.watchdog_exits.append)
+            self.watchdog = watchdog_type(*args, **kwargs, clock=self.clock, terminate=self.watchdog_exits.append)
             return self.watchdog
 
         monkeypatch.setattr("db.Repository", TrackingRepository)
@@ -316,7 +329,9 @@ def test_heartbeat_cleanup_error_does_not_skip_other_cleanup(lifecycle, monkeypa
     assert "heartbeat" in caplog.text.lower()
 
 
-def test_slow_backup_and_recovery_use_startup_budget_then_reset_poll_deadline(lifecycle):
+@pytest.mark.parametrize("initial_time", [0.0, 100.0, 10_000_000_000.0])
+def test_slow_backup_and_recovery_use_startup_budget_then_reset_poll_deadline(lifecycle, initial_time):
+    lifecycle.watchdog_now = initial_time
     observed = []
 
     def initialize():
@@ -327,6 +342,8 @@ def test_slow_backup_and_recovery_use_startup_budget_then_reset_poll_deadline(li
         observed.append("migration")
 
     def worker_started():
+        assert lifecycle.worker_cycle.wait(5)
+        assert lifecycle.application.last_worker_progress == lifecycle.watchdog_now
         assert not lifecycle.watchdog.started
         assert lifecycle.watchdog.failure_reason() is None
         observed.append("recovery")
